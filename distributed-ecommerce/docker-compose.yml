@@ -1,0 +1,172 @@
+version: "3.9"
+
+services:
+  # ─── API Server ───────────────────────────────────────────────
+  api:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      - APP_ENV=development
+    depends_on:
+      - pg-primary
+      - pg-replica1
+      - pg-replica2
+      - mongo-primary
+      - redis-master
+    networks:
+      - app-net
+
+  # ─── PostgreSQL Primary (writes) ──────────────────────────────
+  pg-primary:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: appuser
+      POSTGRES_PASSWORD: secret
+      POSTGRES_DB: orders_shard0
+    volumes:
+      - pg-primary-data:/var/lib/postgresql/data
+      - ./scripts/pg-primary-init.sh:/docker-entrypoint-initdb.d/init.sh
+    ports:
+      - "5432:5432"
+    networks:
+      - app-net
+
+  # ─── PostgreSQL Replica 1 (reads) ─────────────────────────────
+  pg-replica1:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: appuser
+      POSTGRES_PASSWORD: secret
+      POSTGRES_DB: orders_shard1
+    volumes:
+      - pg-replica1-data:/var/lib/postgresql/data
+    ports:
+      - "5433:5432"
+    networks:
+      - app-net
+
+  # ─── PostgreSQL Replica 2 (reads) ─────────────────────────────
+  pg-replica2:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: appuser
+      POSTGRES_PASSWORD: secret
+      POSTGRES_DB: orders_shard2
+    volumes:
+      - pg-replica2-data:/var/lib/postgresql/data
+    ports:
+      - "5434:5432"
+    networks:
+      - app-net
+
+  # ─── MongoDB Primary (replica set) ────────────────────────────
+  mongo-primary:
+    image: mongo:7
+    command: ["mongod", "--replSet", "rs0", "--bind_ip_all"]
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: mongouser
+      MONGO_INITDB_ROOT_PASSWORD: secret
+    volumes:
+      - mongo-primary-data:/data/db
+    ports:
+      - "27017:27017"
+    networks:
+      - app-net
+
+  mongo-secondary1:
+    image: mongo:7
+    command: ["mongod", "--replSet", "rs0", "--bind_ip_all"]
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: mongouser
+      MONGO_INITDB_ROOT_PASSWORD: secret
+    volumes:
+      - mongo-secondary1-data:/data/db
+    ports:
+      - "27018:27017"
+    networks:
+      - app-net
+
+  mongo-secondary2:
+    image: mongo:7
+    command: ["mongod", "--replSet", "rs0", "--bind_ip_all"]
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: mongouser
+      MONGO_INITDB_ROOT_PASSWORD: secret
+    volumes:
+      - mongo-secondary2-data:/data/db
+    ports:
+      - "27019:27017"
+    networks:
+      - app-net
+
+  mongo-init:
+    image: mongo:7
+    depends_on:
+      - mongo-primary
+      - mongo-secondary1
+      - mongo-secondary2
+    volumes:
+      - ./scripts/mongo-init.js:/mongo-init.js
+    command: >
+      bash -c "sleep 10 && mongosh --host mongo-primary:27017 -u mongouser -p secret --authenticationDatabase admin /mongo-init.js"
+    networks:
+      - app-net
+
+  # ─── Redis Master ──────────────────────────────────────────────
+  redis-master:
+    image: redis:7-alpine
+    command: redis-server --requirepass secret --appendonly yes
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-master-data:/data
+    networks:
+      - app-net
+
+  # ─── Redis Replica ─────────────────────────────────────────────
+  redis-replica1:
+    image: redis:7-alpine
+    command: redis-server --requirepass secret --replicaof redis-master 6379 --masterauth secret
+    ports:
+      - "6380:6379"
+    depends_on:
+      - redis-master
+    networks:
+      - app-net
+
+  redis-replica2:
+    image: redis:7-alpine
+    command: redis-server --requirepass secret --replicaof redis-master 6379 --masterauth secret
+    ports:
+      - "6381:6379"
+    depends_on:
+      - redis-master
+    networks:
+      - app-net
+
+  # ─── Redis Sentinel (HA) ───────────────────────────────────────
+  redis-sentinel1:
+    image: redis:7-alpine
+    command: redis-sentinel /etc/redis/sentinel.conf
+    volumes:
+      - ./configs/sentinel.conf:/etc/redis/sentinel.conf
+    depends_on:
+      - redis-master
+      - redis-replica1
+      - redis-replica2
+    networks:
+      - app-net
+
+networks:
+  app-net:
+    driver: bridge
+
+volumes:
+  pg-primary-data:
+  pg-replica1-data:
+  pg-replica2-data:
+  mongo-primary-data:
+  mongo-secondary1-data:
+  mongo-secondary2-data:
+  redis-master-data:

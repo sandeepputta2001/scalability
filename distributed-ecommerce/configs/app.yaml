@@ -1,0 +1,56 @@
+app:
+  env: development
+  port: 8080
+  jwt_secret: "super-secret-jwt-key-change-in-prod"
+  jwt_expiry_hours: 24
+
+# PostgreSQL shards — each shard has a primary (write) + replicas (read)
+postgres:
+  shards:
+    - id: 0
+      primary: "postgres://appuser:secret@pg-primary:5432/orders_shard0?sslmode=disable"
+      replicas:
+        - "postgres://appuser:secret@pg-primary:5432/orders_shard0?sslmode=disable"
+    - id: 1
+      primary: "postgres://appuser:secret@pg-replica1:5432/orders_shard1?sslmode=disable"
+      replicas:
+        - "postgres://appuser:secret@pg-replica1:5432/orders_shard1?sslmode=disable"
+    - id: 2
+      primary: "postgres://appuser:secret@pg-replica2:5432/orders_shard2?sslmode=disable"
+      replicas:
+        - "postgres://appuser:secret@pg-replica2:5432/orders_shard2?sslmode=disable"
+  max_open_conns: 25
+  max_idle_conns: 5
+  conn_max_lifetime_minutes: 5
+
+# MongoDB replica set for product catalog
+mongodb:
+  uri: "mongodb://mongouser:secret@mongo-primary:27017,mongo-secondary1:27017,mongo-secondary2:27017/?replicaSet=rs0&authSource=admin"
+  database: "catalog"
+  read_preference: "secondaryPreferred"  # reads from secondaries when possible
+
+# Redis — master for writes, replicas for reads, sentinel for HA
+redis:
+  master:
+    addr: "redis-master:6379"
+    password: "secret"
+    db: 0
+  replicas:
+    - addr: "redis-replica1:6379"
+      password: "secret"
+      db: 0
+    - addr: "redis-replica2:6379"
+      password: "secret"
+      db: 0
+  sentinel:
+    master_name: "mymaster"
+    addrs:
+      - "redis-sentinel1:26379"
+    password: "secret"
+  ttl:
+    product_seconds: 300       # 5 min
+    user_session_seconds: 3600 # 1 hr
+    cart_seconds: 1800         # 30 min
+    rate_limit_seconds: 60
+  rate_limit:
+    requests_per_minute: 100
