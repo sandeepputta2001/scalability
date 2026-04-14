@@ -21,11 +21,11 @@ const productStaleTTL = 30 * time.Minute
 
 type ProductHandler struct {
 	productRepo *repository.ProductRepository
-	cache       *cache.Client
+	cache       cache.CacheClient
 	log         *zap.Logger
 }
 
-func NewProductHandler(repo *repository.ProductRepository, cache *cache.Client, log *zap.Logger) *ProductHandler {
+func NewProductHandler(repo *repository.ProductRepository, cache cache.CacheClient, log *zap.Logger) *ProductHandler {
 	return &ProductHandler{productRepo: repo, cache: cache, log: log}
 }
 

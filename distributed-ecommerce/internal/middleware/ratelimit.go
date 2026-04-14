@@ -11,7 +11,7 @@ import (
 )
 
 // RateLimit enforces per-IP sliding-window rate limiting via Redis.
-func RateLimit(rc *cache.Client, limit int, log *zap.Logger) gin.HandlerFunc {
+func RateLimit(rc cache.CacheClient, limit int, log *zap.Logger) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		ip := c.ClientIP()
 		allowed, count, err := rc.CheckRateLimit(c.Request.Context(), ip, limit)

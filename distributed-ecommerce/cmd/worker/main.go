@@ -1,20 +1,21 @@
-// Worker processes background jobs: order status updates, cache warming,
-// and replication lag monitoring.
+// Worker runs all Kafka consumer groups and background maintenance jobs.
 package main
 
 import (
 	"context"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
+	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
 
 	"github.com/distributed-ecommerce/internal/cache"
 	"github.com/distributed-ecommerce/internal/config"
 	"github.com/distributed-ecommerce/internal/db"
-	"github.com/distributed-ecommerce/internal/models"
+	kafkapkg "github.com/distributed-ecommerce/internal/kafka"
 	mongoClient "github.com/distributed-ecommerce/internal/mongo"
 	"github.com/distributed-ecommerce/internal/repository"
 )
@@ -47,77 +48,99 @@ func main() {
 	}
 	defer mc.Disconnect(context.Background()) //nolint:errcheck
 
-	redisClient, err := cache.NewClient(cfg.Redis, log)
+	// Use unified client (standalone or cluster based on config)
+	cacheClient, err := cache.NewCacheClient(cfg.Redis, log)
 	if err != nil {
 		log.Fatal("redis", zap.Error(err))
 	}
-	defer redisClient.Close() //nolint:errcheck
+	defer cacheClient.Close() //nolint:errcheck
+
+	// Kafka consumer idempotency needs a raw *redis.Client.
+	// In standalone mode: use the master. In cluster mode: use the cluster client.
+	var redisForKafka redis.UniversalClient
+	if cfg.Redis.Cluster.Enabled {
+		if cc, ok := cacheClient.(*cache.ClusterClient); ok {
+			redisForKafka = cc.Master()
+		}
+	} else {
+		if sc, ok := cacheClient.(*cache.Client); ok {
+			redisForKafka = sc.Master()
+		}
+	}
+	if redisForKafka == nil {
+		// Fallback: create a standalone client for Kafka idempotency
+		redisForKafka = redis.NewClient(&redis.Options{
+			Addr:     cfg.Redis.Master.Addr,
+			Password: cfg.Redis.Master.Password,
+		})
+	}
+
+	producer := kafkapkg.NewProducer(cfg.Kafka, log)
+	defer producer.Close()
+
+	topicCtx, topicCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer topicCancel()
+	if err := kafkapkg.EnsureTopics(topicCtx, cfg.Kafka, log); err != nil {
+		log.Warn("topic creation warning", zap.Error(err))
+	}
 
 	orderRepo := repository.NewOrderRepository(shardMgr, log)
+	productRepo := repository.NewProductRepository(mc, log)
+
+	orderHandler := kafkapkg.NewOrderProcessorHandler(orderRepo, producer, log)
+	stockHandler := kafkapkg.NewStockProcessorHandler(productRepo, cacheClient, log)
+	cacheInvalidator := kafkapkg.NewCacheInvalidatorHandler(cacheClient, log)
+	notifHandler := kafkapkg.NewNotificationHandler(log)
+	analyticsHandler := kafkapkg.NewAnalyticsHandler(log)
+	dlqHandler := kafkapkg.NewDLQReprocessorHandler(producer, log)
+
+	type consumerDef struct {
+		cfg     kafkapkg.ConsumerConfig
+		handler kafkapkg.MessageHandler
+	}
+
+	consumers := []consumerDef{
+		{kafkapkg.ConsumerConfig{Topic: kafkapkg.TopicOrderCreated, GroupID: kafkapkg.GroupOrderProcessor, MaxRetries: 3}, orderHandler.Handle},
+		{kafkapkg.ConsumerConfig{Topic: kafkapkg.TopicOrderConfirmed, GroupID: kafkapkg.GroupOrderProcessor, MaxRetries: 3}, orderHandler.Handle},
+		{kafkapkg.ConsumerConfig{Topic: kafkapkg.TopicOrderShipped, GroupID: kafkapkg.GroupOrderProcessor, MaxRetries: 3}, orderHandler.Handle},
+		{kafkapkg.ConsumerConfig{Topic: kafkapkg.TopicOrderCancelled, GroupID: kafkapkg.GroupOrderProcessor, MaxRetries: 3}, orderHandler.Handle},
+		{kafkapkg.ConsumerConfig{Topic: kafkapkg.TopicStockUpdated, GroupID: kafkapkg.GroupStockProcessor, MaxRetries: 3}, stockHandler.Handle},
+		{kafkapkg.ConsumerConfig{Topic: kafkapkg.TopicOrderCreated, GroupID: kafkapkg.GroupCacheInvalidator, MaxRetries: 2}, cacheInvalidator.Handle},
+		{kafkapkg.ConsumerConfig{Topic: kafkapkg.TopicStockUpdated, GroupID: kafkapkg.GroupCacheInvalidator, MaxRetries: 2}, cacheInvalidator.Handle},
+		{kafkapkg.ConsumerConfig{Topic: kafkapkg.TopicUserRegistered, GroupID: kafkapkg.GroupCacheInvalidator, MaxRetries: 2}, cacheInvalidator.Handle},
+		{kafkapkg.ConsumerConfig{Topic: kafkapkg.TopicOrderCreated, GroupID: kafkapkg.GroupNotificationSvc, MaxRetries: 3}, notifHandler.Handle},
+		{kafkapkg.ConsumerConfig{Topic: kafkapkg.TopicOrderConfirmed, GroupID: kafkapkg.GroupNotificationSvc, MaxRetries: 3}, notifHandler.Handle},
+		{kafkapkg.ConsumerConfig{Topic: kafkapkg.TopicUserRegistered, GroupID: kafkapkg.GroupNotificationSvc, MaxRetries: 3}, notifHandler.Handle},
+		{kafkapkg.ConsumerConfig{Topic: kafkapkg.TopicOrderCreated, GroupID: kafkapkg.GroupAnalyticsSvc, MaxRetries: 1}, analyticsHandler.Handle},
+		{kafkapkg.ConsumerConfig{Topic: kafkapkg.TopicStockUpdated, GroupID: kafkapkg.GroupAnalyticsSvc, MaxRetries: 1}, analyticsHandler.Handle},
+		{kafkapkg.ConsumerConfig{Topic: kafkapkg.TopicDLQ, GroupID: "dlq-reprocessor", MaxRetries: 1}, dlqHandler.Handle},
+	}
+
+	runCtx, runCancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+
+	for _, cd := range consumers {
+		c := kafkapkg.NewConsumer(cfg.Kafka, cd.cfg, producer, redisForKafka, cd.handler, log)
+		wg.Add(1)
+		go func(consumer *kafkapkg.Consumer) {
+			defer wg.Done()
+			defer consumer.Close() //nolint:errcheck
+			consumer.Run(runCtx)
+		}(c)
+	}
+
+	repMonitor := db.NewReplicationMonitor(shardMgr, log)
+	repMonitor.Start()
+	defer repMonitor.Stop()
+
+	log.Info("worker started", zap.Int("consumers", len(consumers)))
 
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
 
-	// Ticker: every 30s auto-confirm pending orders older than 2 minutes
-	confirmTicker := time.NewTicker(30 * time.Second)
-	// Ticker: every 60s log replication lag metrics
-	lagTicker := time.NewTicker(60 * time.Second)
-
-	log.Info("worker started")
-	for {
-		select {
-		case <-confirmTicker.C:
-			runOrderConfirmation(context.Background(), orderRepo, log)
-		case <-lagTicker.C:
-			checkReplicationLag(context.Background(), shardMgr, log)
-		case <-quit:
-			log.Info("worker stopping")
-			confirmTicker.Stop()
-			lagTicker.Stop()
-			return
-		}
-	}
-}
-
-// runOrderConfirmation scatter-gathers pending orders and confirms them.
-func runOrderConfirmation(ctx context.Context, repo *repository.OrderRepository, log *zap.Logger) {
-	orders, err := repo.ScatterGatherOrders(ctx, models.OrderStatusPending, 100)
-	if err != nil {
-		log.Error("scatter gather orders", zap.Error(err))
-		return
-	}
-	confirmed := 0
-	for _, o := range orders {
-		if time.Since(o.CreatedAt) > 2*time.Minute {
-			if err := repo.UpdateStatus(ctx, o.ID, o.UserID, models.OrderStatusConfirmed); err != nil {
-				log.Warn("confirm order", zap.String("id", o.ID.String()), zap.Error(err))
-				continue
-			}
-			confirmed++
-		}
-	}
-	if confirmed > 0 {
-		log.Info("orders confirmed", zap.Int("count", confirmed))
-	}
-}
-
-// checkReplicationLag queries each shard's replica for pg_last_xact_replay_timestamp.
-func checkReplicationLag(ctx context.Context, sm *db.ShardManager, log *zap.Logger) {
-	for _, shard := range sm.AllShards() {
-		for i, replica := range shard.Replicas {
-			var lagSeconds float64
-			err := replica.QueryRow(ctx, `
-				SELECT EXTRACT(EPOCH FROM (NOW() - pg_last_xact_replay_timestamp()))
-			`).Scan(&lagSeconds)
-			if err != nil {
-				log.Warn("replication lag check failed",
-					zap.Int("shard", shard.ID), zap.Int("replica", i), zap.Error(err))
-				continue
-			}
-			log.Info("replication lag",
-				zap.Int("shard", shard.ID),
-				zap.Int("replica", i),
-				zap.Float64("lag_seconds", lagSeconds))
-		}
-	}
+	log.Info("worker shutting down...")
+	runCancel()
+	wg.Wait()
+	log.Info("worker stopped")
 }

@@ -6,9 +6,11 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 	"golang.org/x/crypto/bcrypt"
 
+	"github.com/distributed-ecommerce/internal/kafka"
 	"github.com/distributed-ecommerce/internal/middleware"
 	"github.com/distributed-ecommerce/internal/models"
 	"github.com/distributed-ecommerce/internal/repository"
@@ -16,14 +18,16 @@ import (
 
 type AuthHandler struct {
 	userRepo  *repository.UserRepository
+	producer  *kafka.Producer
 	jwtSecret string
 	jwtExpiry time.Duration
 	log       *zap.Logger
 }
 
-func NewAuthHandler(userRepo *repository.UserRepository, secret string, expiryHours int, log *zap.Logger) *AuthHandler {
+func NewAuthHandler(userRepo *repository.UserRepository, producer *kafka.Producer, secret string, expiryHours int, log *zap.Logger) *AuthHandler {
 	return &AuthHandler{
 		userRepo:  userRepo,
+		producer:  producer,
 		jwtSecret: secret,
 		jwtExpiry: time.Duration(expiryHours) * time.Hour,
 		log:       log,
@@ -55,6 +59,26 @@ func (h *AuthHandler) Register(c *gin.Context) {
 		h.log.Error("register failed", zap.Error(err))
 		c.JSON(http.StatusConflict, gin.H{"error": "email already exists"})
 		return
+	}
+
+	// Publish user.registered event to Kafka
+	correlationID := uuid.New().String()
+	env, err := kafka.NewEnvelope(
+		kafka.EventUserRegistered,
+		user.ID.String(),
+		"user",
+		correlationID,
+		kafka.UserRegisteredEvent{
+			UserID:   user.ID.String(),
+			Email:    user.Email,
+			Name:     user.Name,
+			ShardKey: user.ShardKey,
+		},
+	)
+	if err == nil {
+		if pubErr := h.producer.Publish(c.Request.Context(), kafka.TopicUserRegistered, env); pubErr != nil {
+			h.log.Warn("kafka publish failed for user.registered", zap.Error(pubErr))
+		}
 	}
 
 	token, err := h.generateToken(user)

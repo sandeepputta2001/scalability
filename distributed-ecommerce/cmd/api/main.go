@@ -16,6 +16,7 @@ import (
 	"github.com/distributed-ecommerce/internal/config"
 	"github.com/distributed-ecommerce/internal/db"
 	"github.com/distributed-ecommerce/internal/handlers"
+	kafkapkg "github.com/distributed-ecommerce/internal/kafka"
 	"github.com/distributed-ecommerce/internal/middleware"
 	mongoClient "github.com/distributed-ecommerce/internal/mongo"
 	"github.com/distributed-ecommerce/internal/repository"
@@ -37,7 +38,7 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	// ── PostgreSQL shards (consistent hash ring) ──────────────────────────────
+	// ── PostgreSQL shards ─────────────────────────────────────────────────────
 	shardMgr, err := db.NewShardManager(ctx, cfg.Postgres, log)
 	if err != nil {
 		log.Fatal("shard manager", zap.Error(err))
@@ -48,7 +49,7 @@ func main() {
 		log.Fatal("migrations", zap.Error(err))
 	}
 
-	// ── Replication monitor (lag-aware read routing) ──────────────────────────
+	// ── Replication monitor ───────────────────────────────────────────────────
 	repMonitor := db.NewReplicationMonitor(shardMgr, log)
 	repMonitor.Start()
 	defer repMonitor.Stop()
@@ -56,23 +57,33 @@ func main() {
 	// ── Cross-shard join engine ───────────────────────────────────────────────
 	joiner := db.NewCrossShardJoiner(shardMgr, log)
 
-	// ── MongoDB (replica set, secondaryPreferred reads) ───────────────────────
+	// ── MongoDB ───────────────────────────────────────────────────────────────
 	mc, err := mongoClient.NewClient(ctx, cfg.MongoDB, log)
 	if err != nil {
 		log.Fatal("mongodb", zap.Error(err))
 	}
 	defer mc.Disconnect(context.Background()) //nolint:errcheck
 
-	// ── Redis (master/replica + sentinel) ────────────────────────────────────
-	redisClient, err := cache.NewClient(cfg.Redis, log)
+	// ── Redis (standalone or cluster based on config) ─────────────────────────
+	redisClient, err := cache.NewCacheClient(cfg.Redis, log)
 	if err != nil {
 		log.Fatal("redis", zap.Error(err))
 	}
 	defer redisClient.Close() //nolint:errcheck
 
-	// ── Write-behind buffer (async DB writes) ─────────────────────────────────
 	writeBehind := cache.NewWriteBehindBuffer(redisClient, 1000, log)
 	defer writeBehind.Stop()
+
+	// ── Kafka producer ────────────────────────────────────────────────────────
+	producer := kafkapkg.NewProducer(cfg.Kafka, log)
+	defer producer.Close()
+
+	// Ensure topics exist (idempotent)
+	topicCtx, topicCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer topicCancel()
+	if err := kafkapkg.EnsureTopics(topicCtx, cfg.Kafka, log); err != nil {
+		log.Warn("kafka topic setup warning", zap.Error(err))
+	}
 
 	// ── Repositories ──────────────────────────────────────────────────────────
 	userRepo := repository.NewUserRepository(shardMgr, log)
@@ -80,9 +91,9 @@ func main() {
 	orderRepo := repository.NewOrderRepository(shardMgr, log)
 
 	// ── Handlers ──────────────────────────────────────────────────────────────
-	authHandler := handlers.NewAuthHandler(userRepo, cfg.App.JWTSecret, cfg.App.JWTExpiryHours, log)
+	authHandler := handlers.NewAuthHandler(userRepo, producer, cfg.App.JWTSecret, cfg.App.JWTExpiryHours, log)
 	productHandler := handlers.NewProductHandler(productRepo, redisClient, log)
-	orderHandler := handlers.NewOrderHandler(orderRepo, productRepo, redisClient, log)
+	orderHandler := handlers.NewOrderHandler(orderRepo, productRepo, redisClient, producer, log)
 	cartHandler := handlers.NewCartHandler(productRepo, redisClient, log)
 	adminHandler := handlers.NewAdminHandler(joiner, repMonitor, shardMgr, redisClient, log)
 
@@ -100,6 +111,7 @@ func main() {
 			"status":            "ok",
 			"shards":            shardMgr.ShardCount(),
 			"ring_distribution": shardMgr.RingDistribution(),
+			"kafka_brokers":     cfg.Kafka.Brokers,
 			"service":           "distributed-ecommerce",
 		})
 	})
@@ -110,7 +122,6 @@ func main() {
 		auth.POST("/register", authHandler.Register)
 		auth.POST("/login", authHandler.Login)
 
-		// Products: GET supports ?consistency=strong|stale|eventual
 		products := v1.Group("/products")
 		products.GET("", productHandler.ListProducts)
 		products.GET("/search", productHandler.SearchProducts)
@@ -130,21 +141,19 @@ func main() {
 			protected.DELETE("/cart", cartHandler.ClearCart)
 		}
 
-		// Admin: observability + distributed systems diagnostics
 		admin := v1.Group("/admin")
 		admin.Use(middleware.JWTAuth(cfg.App.JWTSecret, log))
 		{
-			// Shard stats + ring distribution
 			admin.GET("/shards", adminHandler.GetShardStats)
-			// Replication lag per shard/replica
 			admin.GET("/replication-lag", adminHandler.GetReplicationLag)
-			// Cross-shard scatter-gather + application-level join
 			admin.GET("/orders-with-users", adminHandler.CrossShardOrdersWithUsers)
-			// Cache inconsistency audit log
 			admin.GET("/cache-inconsistencies", adminHandler.GetCacheInconsistencies)
-			// Tag-based cache invalidation
 			admin.GET("/cache-tag/:tag", adminHandler.GetCacheTagVersion)
 			admin.POST("/cache-tag/:tag/bump", adminHandler.BumpCacheTag)
+			// Redis Cluster observability
+			admin.GET("/redis-cluster", adminHandler.GetRedisClusterStats)
+			admin.GET("/redis-hot-keys", adminHandler.GetHotKeys)
+			admin.GET("/redis-slot", adminHandler.GetSlotInfo)
 		}
 	}
 

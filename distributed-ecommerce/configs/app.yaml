@@ -27,10 +27,13 @@ postgres:
 mongodb:
   uri: "mongodb://mongouser:secret@mongo-primary:27017,mongo-secondary1:27017,mongo-secondary2:27017/?replicaSet=rs0&authSource=admin"
   database: "catalog"
-  read_preference: "secondaryPreferred"  # reads from secondaries when possible
+  read_preference: "secondaryPreferred"
 
-# Redis — master for writes, replicas for reads, sentinel for HA
+# Redis — two modes selectable via cluster.enabled
+# Mode A: standalone (master/replica/sentinel) — dev default
+# Mode B: cluster (3 masters × 1 replica, sharded) — production
 redis:
+  # ── Standalone mode (cluster.enabled = false) ──────────────────
   master:
     addr: "redis-master:6379"
     password: "secret"
@@ -47,10 +50,40 @@ redis:
     addrs:
       - "redis-sentinel1:26379"
     password: "secret"
+
+  # ── Cluster mode (cluster.enabled = true) ──────────────────────
+  # 3 masters × 1 replica = 6 nodes, 16384 hash slots
+  # Each master owns ~5461 slots; replicas mirror their master.
+  # Sharding: CRC16(key) % 16384 → slot → master node
+  # Replication: async, automatic failover (no Sentinel needed)
+  cluster:
+    enabled: false          # set true to use cluster mode
+    addrs:
+      - "redis-cluster-1:7001"
+      - "redis-cluster-2:7002"
+      - "redis-cluster-3:7003"
+      - "redis-cluster-4:7004"
+      - "redis-cluster-5:7005"
+      - "redis-cluster-6:7006"
+    password: "secret"
+    read_from_replica: true  # route reads to replicas (eventual consistency)
+    max_redirects: 8         # follow MOVED/ASK redirects during resharding
+
   ttl:
-    product_seconds: 300       # 5 min
-    user_session_seconds: 3600 # 1 hr
-    cart_seconds: 1800         # 30 min
+    product_seconds: 300
+    user_session_seconds: 3600
+    cart_seconds: 1800
     rate_limit_seconds: 60
   rate_limit:
     requests_per_minute: 100
+
+# Kafka — 3-broker cluster for replication + partitioning
+# Partitioning = sharding for Kafka (each partition is an independent ordered log)
+# Replication  = each partition has RF-1 follower replicas on different brokers
+kafka:
+  brokers:
+    - "kafka-1:9092"
+    - "kafka-2:9092"
+    - "kafka-3:9092"
+  replication_factor: 3   # RF=3: tolerates 2 broker failures
+  auto_create_topics: true # set false in production

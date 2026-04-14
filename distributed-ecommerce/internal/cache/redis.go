@@ -191,3 +191,9 @@ func (c *Client) Close() error {
 	}
 	return c.master.Close()
 }
+
+// Master returns the underlying master redis.Client (used by Kafka consumers
+// for idempotency checks and offset caching).
+func (c *Client) Master() *redis.Client {
+	return c.master
+}

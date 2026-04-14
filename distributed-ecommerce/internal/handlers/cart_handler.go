@@ -19,11 +19,11 @@ import (
 // and don't need durable storage.
 type CartHandler struct {
 	productRepo *repository.ProductRepository
-	cache       *cache.Client
+	cache       cache.CacheClient
 	log         *zap.Logger
 }
 
-func NewCartHandler(productRepo *repository.ProductRepository, cache *cache.Client, log *zap.Logger) *CartHandler {
+func NewCartHandler(productRepo *repository.ProductRepository, cache cache.CacheClient, log *zap.Logger) *CartHandler {
 	return &CartHandler{productRepo: productRepo, cache: cache, log: log}
 }
 

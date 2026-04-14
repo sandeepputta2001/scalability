@@ -1,4 +1,4 @@
-.PHONY: up down tidy build seed logs
+.PHONY: up down tidy build seed logs kafka-ui
 
 up:
 	docker compose up -d --build
@@ -11,6 +11,10 @@ tidy:
 
 build:
 	go build ./...
+
+kafka-ui:
+	@echo "Kafka UI: http://localhost:8090"
+	@open http://localhost:8090 2>/dev/null || xdg-open http://localhost:8090 2>/dev/null || true
 
 # Seed sample products into MongoDB
 seed:
@@ -31,6 +35,9 @@ seed:
 
 logs:
 	docker compose logs -f api
+
+worker-logs:
+	docker compose logs -f worker
 
 health:
 	curl -s http://localhost:8080/health | jq .

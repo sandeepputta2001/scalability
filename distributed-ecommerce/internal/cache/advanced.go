@@ -82,7 +82,7 @@ type WriteBehindEntry struct {
 // WriteBehindBuffer buffers writes and flushes them to DB asynchronously.
 // This gives sub-millisecond write latency at the cost of potential data loss.
 type WriteBehindBuffer struct {
-	cache  *Client
+	cache  CacheClient
 	ch     chan WriteBehindEntry
 	log    *zap.Logger
 	wg     sync.WaitGroup
@@ -90,7 +90,7 @@ type WriteBehindBuffer struct {
 }
 
 // NewWriteBehindBuffer creates a buffer that drains writes to DB in the background.
-func NewWriteBehindBuffer(c *Client, bufSize int, log *zap.Logger) *WriteBehindBuffer {
+func NewWriteBehindBuffer(c CacheClient, bufSize int, log *zap.Logger) *WriteBehindBuffer {
 	wb := &WriteBehindBuffer{
 		cache:  c,
 		ch:     make(chan WriteBehindEntry, bufSize),

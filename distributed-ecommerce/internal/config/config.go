@@ -13,6 +13,7 @@ type Config struct {
 	Postgres PostgresConfig `mapstructure:"postgres"`
 	MongoDB  MongoConfig    `mapstructure:"mongodb"`
 	Redis    RedisConfig    `mapstructure:"redis"`
+	Kafka    KafkaConfig    `mapstructure:"kafka"`
 }
 
 type AppConfig struct {
@@ -42,11 +43,32 @@ type MongoConfig struct {
 }
 
 type RedisConfig struct {
-	Master    RedisNodeConfig   `mapstructure:"master"`
-	Replicas  []RedisNodeConfig `mapstructure:"replicas"`
-	Sentinel  SentinelConfig    `mapstructure:"sentinel"`
-	TTL       RedisTTLConfig    `mapstructure:"ttl"`
-	RateLimit RateLimitConfig   `mapstructure:"rate_limit"`
+	// Standalone mode (single master + replicas + sentinel)
+	// Used when cluster.enabled = false
+	Master   RedisNodeConfig   `mapstructure:"master"`
+	Replicas []RedisNodeConfig `mapstructure:"replicas"`
+	Sentinel SentinelConfig    `mapstructure:"sentinel"`
+
+	// Cluster mode (sharded — 3 masters × 1 replica each)
+	// Used when cluster.enabled = true
+	Cluster RedisClusterConfig `mapstructure:"cluster"`
+
+	TTL       RedisTTLConfig  `mapstructure:"ttl"`
+	RateLimit RateLimitConfig `mapstructure:"rate_limit"`
+}
+
+// RedisClusterConfig configures Redis Cluster (sharding + replication built-in).
+// Redis Cluster shards data across N masters using CRC16 hash slots (0-16383).
+// Each master owns a contiguous range of slots; replicas mirror their master.
+type RedisClusterConfig struct {
+	Enabled  bool     `mapstructure:"enabled"`
+	Addrs    []string `mapstructure:"addrs"` // all nodes (masters + replicas)
+	Password string   `mapstructure:"password"`
+	// ReadFromReplica: route read commands to replica nodes.
+	// Tradeoff: lower master load + higher read throughput vs. stale reads.
+	ReadFromReplica bool `mapstructure:"read_from_replica"`
+	// MaxRedirects: how many MOVED/ASK redirects to follow before giving up.
+	MaxRedirects int `mapstructure:"max_redirects"`
 }
 
 type RedisNodeConfig struct {
@@ -70,6 +92,14 @@ type RedisTTLConfig struct {
 
 type RateLimitConfig struct {
 	RequestsPerMinute int `mapstructure:"requests_per_minute"`
+}
+
+// ─── Kafka ────────────────────────────────────────────────────────────────────
+
+type KafkaConfig struct {
+	Brokers           []string `mapstructure:"brokers"`
+	ReplicationFactor int      `mapstructure:"replication_factor"`
+	AutoCreateTopics  bool     `mapstructure:"auto_create_topics"`
 }
 
 func (c *RedisTTLConfig) ProductTTL() time.Duration {

@@ -1,79 +1,102 @@
 # Distributed E-Commerce Platform
 
-A production-grade Go service demonstrating **sharding**, **replication**, and **caching** across PostgreSQL, MongoDB, and Redis.
+A production-grade Go service demonstrating **sharding**, **replication**, **caching**, and **event streaming** across PostgreSQL, MongoDB, Redis, and Kafka.
 
 ---
 
 ## Architecture
 
 ```
-Client
-  │
-  ▼
-┌─────────────────────────────────────────────────────┐
-│  API Server (Gin)                                   │
-│  • Rate limiting (Redis sliding window)             │
-│  • JWT auth                                         │
-│  • Cache-aside (Redis → MongoDB/PostgreSQL)         │
-└──────┬──────────────┬──────────────┬────────────────┘
-       │              │              │
-       ▼              ▼              ▼
-┌────────────┐  ┌──────────────┐  ┌──────────────────┐
-│ PostgreSQL │  │   MongoDB    │  │      Redis        │
-│  Sharding  │  │ Replica Set  │  │  Master/Replica   │
-│            │  │              │  │  + Sentinel HA    │
-│ Shard 0    │  │ Primary      │  │                   │
-│  primary   │  │ Secondary ×2 │  │ Master (writes)   │
-│  replicas  │  │              │  │ Replica ×2 (reads)│
-│            │  │ readPref:    │  │ Sentinel ×1       │
-│ Shard 1    │  │ secondary    │  │                   │
-│ Shard 2    │  │ Preferred    │  │                   │
-└────────────┘  └──────────────┘  └──────────────────┘
+                         ┌──────────────────────────────────────┐
+                         │           API Server (Go/Gin)        │
+                         │  Auth │ Products │ Orders │ Cart     │
+                         │  Rate Limit (Redis) │ JWT Auth       │
+                         └──────┬──────────┬──────────┬─────────┘
+                                │          │          │
+              ┌─────────────────▼──┐  ┌────▼──────┐  ┌▼──────────────────┐
+              │  PostgreSQL         │  │  MongoDB  │  │      Redis        │
+              │  Consistent Hash    │  │  Replica  │  │  Master/Replica   │
+              │  Ring (3 shards)    │  │  Set ×3   │  │  + Sentinel HA    │
+              └─────────────────────┘  └───────────┘  └───────────────────┘
+                                │
+                         ┌──────▼──────────────────────────────────────────┐
+                         │              Kafka Cluster (3 brokers)          │
+                         │  KRaft mode — no ZooKeeper                      │
+                         │                                                  │
+                         │  Topics (partitioned + replicated):              │
+                         │  order.created    [6 partitions, RF=3]          │
+                         │  order.confirmed  [6 partitions, RF=3]          │
+                         │  order.shipped    [6 partitions, RF=3]          │
+                         │  order.cancelled  [6 partitions, RF=3]          │
+                         │  stock.updated    [3 partitions, RF=3]          │
+                         │  user.registered  [3 partitions, RF=3]          │
+                         │  events.dlq       [1 partition,  RF=3]          │
+                         └──────┬──────────────────────────────────────────┘
+                                │
+                         ┌──────▼──────────────────────────────────────────┐
+                         │              Worker (Consumer Groups)           │
+                         │  order-processor    — PG status updates         │
+                         │  stock-processor    — Redis cache invalidation  │
+                         │  cache-invalidator  — event-driven invalidation │
+                         │  notification-svc   — email/push (stub)         │
+                         │  analytics-svc      — data warehouse (stub)     │
+                         │  dlq-reprocessor    — dead-letter handling      │
+                         └─────────────────────────────────────────────────┘
 ```
 
-## Key Concepts Demonstrated
+---
 
-### Sharding (PostgreSQL)
-- **Consistent hashing** (FNV-1a mod N) routes users and orders to the correct shard
-- Shard key stored on every record — no scatter-gather needed for user-scoped queries
-- **Scatter-gather** implemented for admin cross-shard queries (parallel goroutines)
-- `ShardManager` abstracts all routing; handlers never touch shard logic directly
+## Key Concepts
 
-### Replication (PostgreSQL + MongoDB + Redis)
-| Layer | Strategy |
-|---|---|
-| PostgreSQL | 3 independent shard nodes (each acts as primary for its key range) |
-| MongoDB | 3-node replica set (1 primary + 2 secondaries), `secondaryPreferred` reads |
-| Redis | 1 master + 2 replicas + 1 Sentinel for automatic failover |
+### Kafka Partitioning (= Sharding for Kafka)
+- Each topic is split into N partitions — each is an independent ordered log
+- Partition key = `user_id` → all events for a user land on the same partition → per-user ordering guarantee
+- `order.created` has 6 partitions → 6 consumer instances can process in parallel
+- Adding consumers to a group triggers rebalance; each partition assigned to exactly one consumer
 
-- Writes always go to the **primary/master**
-- Reads are **round-robin load balanced** across replicas
-- Redis Sentinel monitors master health and promotes a replica on failure
+### Kafka Replication
+- Replication Factor = 3: 1 leader + 2 follower replicas on different brokers
+- `acks=all` (RequireAll): leader waits for all ISR replicas before confirming write
+- `min.insync.replicas=2`: at least 2 replicas must ack → tolerates 1 broker failure during writes
+- KRaft mode: no ZooKeeper dependency; brokers elect a controller internally
 
-### Caching (Redis)
-- **Cache-aside** pattern for product reads (check Redis → miss → MongoDB → populate cache)
-- **TTL-based expiry**: products 5 min, carts 30 min, sessions 1 hr
-- **Write-through invalidation**: product cache cleared on stock update
-- **Shopping cart** stored entirely in Redis (ephemeral, high-churn data)
-- **Distributed lock** (SET NX PX) prevents duplicate order submissions
-- **Sliding-window rate limiting** via Redis INCR + EXPIRE pipeline
+### Exactly-Once Processing
+- Producer: `acks=all` + retry → at-least-once delivery
+- Consumer: Redis `SET NX` idempotency check on `event_id` → deduplication
+- Combined: exactly-once semantics per consumer group
+- Offset committed AFTER processing (not before) → no message loss on crash
+
+### Dead-Letter Queue
+- After 3 failed retries, message routed to `events.dlq`
+- DLQ consumer logs for manual inspection / alerting
+- Idempotency key deleted so DLQ reprocessor can retry
+
+### Event-Driven Cache Invalidation
+- `cache-invalidator` consumer group subscribes to all data-changing topics
+- Invalidates Redis keys when events arrive (more reliable than synchronous invalidation)
+- Inconsistency window = Kafka consumer lag (typically <100ms)
+
+### PostgreSQL Sharding (Consistent Hash Ring)
+- 150 virtual nodes per shard → even distribution, minimal rebalancing on shard add/remove
+- Shard key stored on every record → single-shard reads, no scatter-gather for user queries
+- Cross-shard join: scatter-gather + application-level hash join
+
+### Redis Caching Patterns
+- Cache-aside, write-through, write-behind, singleflight, stale-while-revalidate
+- Probabilistic early expiry (XFetch) prevents thundering herd
+- Tag-based invalidation for bulk cache busting
+- Offset caching: Kafka consumer offsets cached in Redis for fast restart
 
 ---
 
 ## Quick Start
 
 ```bash
-# Start all infrastructure + API
-make up
-
-# Check health
-make health
-
-# Seed sample data
-make seed
-
-# View logs
-make logs
+make up       # start all infrastructure + API + worker
+make health   # check API health
+make seed     # create sample products
+make logs     # tail API logs
+make kafka-ui # open Kafka UI at http://localhost:8090
 ```
 
 ## API Endpoints
@@ -84,17 +107,24 @@ POST   /api/v1/auth/login
 
 GET    /api/v1/products?category=electronics&page=1
 GET    /api/v1/products/search?q=laptop
-GET    /api/v1/products/:id
-POST   /api/v1/products          (auth required)
+GET    /api/v1/products/:id?consistency=strong|stale|eventual
+POST   /api/v1/products          (auth)
 
-GET    /api/v1/cart              (auth required)
-POST   /api/v1/cart/items        (auth required)
-DELETE /api/v1/cart/items/:id    (auth required)
-DELETE /api/v1/cart              (auth required)
+GET    /api/v1/cart              (auth)
+POST   /api/v1/cart/items        (auth)
+DELETE /api/v1/cart/items/:id    (auth)
+DELETE /api/v1/cart              (auth)
 
-GET    /api/v1/orders            (auth required)
-POST   /api/v1/orders            (auth required)
-GET    /api/v1/orders/:id        (auth required)
+GET    /api/v1/orders            (auth)
+POST   /api/v1/orders            (auth)  → publishes order.created to Kafka
+GET    /api/v1/orders/:id        (auth)
+
+GET    /api/v1/admin/shards                  (auth)
+GET    /api/v1/admin/replication-lag         (auth)
+GET    /api/v1/admin/orders-with-users       (auth)
+GET    /api/v1/admin/cache-inconsistencies   (auth)
+GET    /api/v1/admin/cache-tag/:tag          (auth)
+POST   /api/v1/admin/cache-tag/:tag/bump     (auth)
 
 GET    /health
 ```
@@ -104,7 +134,33 @@ GET    /health
 | Component | Role |
 |---|---|
 | Go + Gin | API server |
-| PostgreSQL ×3 | Sharded order/user storage |
-| MongoDB ×3 | Replicated product catalog |
-| Redis ×3 + Sentinel | Caching, sessions, rate limiting, distributed locks |
+| PostgreSQL ×3 | Sharded order/user storage (consistent hash ring) |
+| MongoDB ×3 | Replicated product catalog (replica set) |
+| Redis ×3 + Sentinel | Caching, sessions, rate limiting, distributed locks, offset cache |
+| Kafka ×3 (KRaft) | Event streaming, partitioned topics, exactly-once processing |
+| Kafka UI | Topic/consumer group observability at :8090 |
 | Docker Compose | Local orchestration |
+
+## File Structure
+
+```
+internal/
+  kafka/
+    topics.go     — topic names, partition counts, consumer group IDs
+    events.go     — Envelope schema, domain event payloads
+    producer.go   — partitioned producer, acks=all, Snappy compression
+    consumer.go   — consumer group, idempotency, DLQ routing, offset cache
+    admin.go      — topic creation with correct RF + partition count
+    handlers.go   — OrderProcessor, StockProcessor, CacheInvalidator, etc.
+  db/
+    sharding.go         — consistent hash ring ShardManager
+    consistent_hash.go  — virtual-node ring (150 vnodes/shard)
+    replication_monitor.go — lag-aware read routing
+    cross_shard_join.go — scatter-gather + application-level hash join
+  cache/
+    redis.go     — master/replica client, rate limit, distributed lock
+    advanced.go  — write-through, write-behind, singleflight, XFetch, SWR
+  handlers/
+    order_handler.go — publishes order.created to Kafka after DB write
+    auth_handler.go  — publishes user.registered to Kafka after registration
+```
