@@ -1,0 +1,1427 @@
+openapi: "3.1.0"
+info:
+  title: Distributed E-Commerce API
+  version: "1.0.0"
+  description: |
+    Production-grade distributed e-commerce platform demonstrating sharding,
+    replication, caching, Kafka event streaming, and 29 design patterns.
+
+    ## Authentication
+    All protected endpoints require a Bearer JWT token obtained from
+    `POST /api/v1/auth/login` or `POST /api/v1/auth/register`.
+
+    ```
+    Authorization: Bearer <token>
+    ```
+
+    ## Consistency Control
+    Every request can carry a consistency level via header or query param:
+
+    | Value | Behaviour | Use case |
+    |---|---|---|
+    | `eventual` (default) | Reads from replica | Product listings |
+    | `session` | Primary for 5s after write | Cart, profile |
+    | `bounded-staleness` | Replica if lag < 30s | Inventory display |
+    | `strong` | Always primary | Checkout, payment |
+
+    ```
+    X-Consistency: strong
+    # or
+    GET /api/v1/products/123?consistency=strong
+    ```
+
+    ## Rate Limiting
+    100 requests per minute per IP. Exceeded requests receive `429`.
+    Headers returned on every response:
+    - `X-RateLimit-Limit: 100`
+    - `X-RateLimit-Remaining: <n>`
+
+servers:
+  - url: http://localhost:8080
+    description: Local development
+
+tags:
+  - name: Health
+    description: Service health and infrastructure status
+  - name: Auth
+    description: Registration and login
+  - name: Products
+    description: Product catalogue (MongoDB, Redis cache)
+  - name: Orders
+    description: Order management (sharded PostgreSQL, Kafka outbox)
+  - name: Cart
+    description: Shopping cart (Redis only, ephemeral)
+  - name: Admin — Sharding
+    description: PostgreSQL shard stats and cross-shard queries
+  - name: Admin — Replication
+    description: Replication lag monitoring
+  - name: Admin — Cache
+    description: Redis cache diagnostics and tag invalidation
+  - name: Admin — Kafka / Outbox
+    description: Outbox event stats
+  - name: Admin — Load Balancer
+    description: Load balancer node health and partition distribution
+  - name: Admin — Patterns
+    description: Design pattern observability (bulkheads, circuit breakers, sagas)
+
+# ─── Security ─────────────────────────────────────────────────────────────────
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  schemas:
+    Error:
+      type: object
+      properties:
+        error:
+          type: string
+          example: "invalid credentials"
+
+    User:
+      type: object
+      properties:
+        id:          { type: string, format: uuid }
+        email:       { type: string, format: email }
+        name:        { type: string }
+        shard_key:   { type: integer, description: "PostgreSQL shard this user lives on" }
+        created_at:  { type: string, format: date-time }
+
+    LoginResponse:
+      type: object
+      properties:
+        token: { type: string, description: "JWT Bearer token, valid 24h" }
+        user:  { $ref: "#/components/schemas/User" }
+
+    Product:
+      type: object
+      properties:
+        id:          { type: string, description: "MongoDB ObjectID hex" }
+        name:        { type: string }
+        description: { type: string }
+        price:       { type: number, format: double }
+        stock:       { type: integer }
+        category:    { type: string }
+        tags:        { type: array, items: { type: string } }
+        attributes:  { type: object, additionalProperties: { type: string } }
+        created_at:  { type: string, format: date-time }
+        updated_at:  { type: string, format: date-time }
+
+    OrderItem:
+      type: object
+      properties:
+        id:         { type: string, format: uuid }
+        order_id:   { type: string, format: uuid }
+        product_id: { type: string }
+        quantity:   { type: integer, minimum: 1 }
+        unit_price: { type: number, format: double }
+
+    Order:
+      type: object
+      properties:
+        id:          { type: string, format: uuid }
+        user_id:     { type: string, format: uuid }
+        status:
+          type: string
+          enum: [pending, confirmed, shipped, delivered, cancelled]
+        total_price: { type: number, format: double }
+        shard_key:   { type: integer }
+        created_at:  { type: string, format: date-time }
+        updated_at:  { type: string, format: date-time }
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/OrderItem" }
+
+    CartItem:
+      type: object
+      properties:
+        product_id: { type: string }
+        name:       { type: string }
+        quantity:   { type: integer, minimum: 1 }
+        unit_price: { type: number, format: double }
+
+    Cart:
+      type: object
+      properties:
+        user_id:    { type: string }
+        items:      { type: array, items: { $ref: "#/components/schemas/CartItem" } }
+        updated_at: { type: string, format: date-time }
+
+    ReplicaInfo:
+      type: object
+      properties:
+        index:       { type: integer }
+        lag_seconds: { type: number }
+        degraded:    { type: boolean, description: "true if lag > 5s; reads fall back to primary" }
+
+    ShardLagInfo:
+      type: object
+      properties:
+        shard_id: { type: integer }
+        replicas: { type: array, items: { $ref: "#/components/schemas/ReplicaInfo" } }
+
+    NodeStats:
+      type: object
+      properties:
+        id:           { type: string }
+        addr:         { type: string }
+        weight:       { type: integer }
+        healthy:      { type: boolean }
+        active_conns: { type: integer }
+        fail_count:   { type: integer }
+        algorithm:    { type: string }
+
+    BulkheadStats:
+      type: object
+      properties:
+        name:           { type: string }
+        capacity:       { type: integer }
+        in_use:         { type: integer }
+        available:      { type: integer }
+        total_acquired: { type: integer }
+        total_rejected: { type: integer }
+
+    CircuitBreakerStats:
+      type: object
+      properties:
+        name:     { type: string }
+        state:    { type: string, enum: [closed, open, half-open] }
+        failures: { type: integer }
+
+    SagaStepResult:
+      type: object
+      properties:
+        name:           { type: string }
+        status:         { type: string, enum: [pending, completed, failed, compensated] }
+        error:          { type: string }
+        executed_at:    { type: string, format: date-time }
+        compensated_at: { type: string, format: date-time, nullable: true }
+
+    SagaExecution:
+      type: object
+      properties:
+        id:         { type: string }
+        name:       { type: string }
+        status:     { type: string, enum: [running, completed, failed, comp_failed] }
+        steps:      { type: array, items: { $ref: "#/components/schemas/SagaStepResult" } }
+        state:      { type: object }
+        started_at: { type: string, format: date-time }
+        ended_at:   { type: string, format: date-time, nullable: true }
+
+    DistributionReport:
+      type: object
+      properties:
+        counts:                { type: array, items: { type: integer } }
+        total:                 { type: integer }
+        mean:                  { type: number }
+        std_dev:               { type: number }
+        skew_coefficient:      { type: number, description: "> 0.2 means uneven distribution" }
+        hottest_partition:     { type: integer }
+        coldest_partition:     { type: integer }
+        rebalance_recommended: { type: boolean }
+
+    InconsistencyEvent:
+      type: object
+      properties:
+        key:         { type: string }
+        cache_val:   { type: string }
+        db_val:      { type: string }
+        detected_at: { type: string, format: date-time }
+
+    OutboxShardStats:
+      type: object
+      properties:
+        shard_id: { type: integer }
+        counts:
+          type: object
+          properties:
+            pending:   { type: integer }
+            published: { type: integer }
+            failed:    { type: integer }
+
+# ─── Paths ────────────────────────────────────────────────────────────────────
+paths:
+
+  # ── Health ──────────────────────────────────────────────────────────────────
+  /health:
+    get:
+      tags: [Health]
+      summary: Service health check
+      description: |
+        Returns service status, shard count, and Kafka broker list.
+        Does not require authentication. Used by load balancers and monitoring.
+      responses:
+        "200":
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:   { type: string, example: ok }
+                  shards:   { type: integer, example: 3 }
+                  service:  { type: string, example: distributed-ecommerce }
+              example:
+                status: ok
+                shards: 3
+                service: distributed-ecommerce
+
+  # ── Auth ────────────────────────────────────────────────────────────────────
+  /api/v1/auth/register:
+    post:
+      tags: [Auth]
+      summary: Register a new user
+      description: |
+        Creates a new user account. The user is stored in the PostgreSQL shard
+        determined by consistent-hashing the email address.
+
+        Side effects:
+        - Publishes `user.registered` event to Kafka topic `user.registered`
+        - Returns a JWT token valid for 24 hours
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password, name]
+              properties:
+                email:    { type: string, format: email, example: "alice@example.com" }
+                password: { type: string, minLength: 8, example: "s3cr3tpass" }
+                name:     { type: string, example: "Alice Smith" }
+      responses:
+        "201":
+          description: User created, JWT returned
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LoginResponse" }
+        "400":
+          description: Validation error (missing fields, invalid email)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          description: Email already registered
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example: { error: "email already exists" }
+
+  /api/v1/auth/login:
+    post:
+      tags: [Auth]
+      summary: Login and obtain a JWT token
+      description: |
+        Authenticates with email + password. Routes the lookup to the correct
+        PostgreSQL shard via consistent hash of the email.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email:    { type: string, format: email, example: "alice@example.com" }
+                password: { type: string, example: "s3cr3tpass" }
+      responses:
+        "200":
+          description: Login successful
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LoginResponse" }
+        "400":
+          description: Validation error
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          description: Invalid credentials
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example: { error: "invalid credentials" }
+
+  # ── Products ─────────────────────────────────────────────────────────────────
+  /api/v1/products:
+    get:
+      tags: [Products]
+      summary: List products with optional category filter
+      description: |
+        Returns a paginated list of products from MongoDB.
+        Reads use `secondaryPreferred` — served by a secondary replica when available.
+      parameters:
+        - name: category
+          in: query
+          description: Filter by category (exact match)
+          schema: { type: string, example: electronics }
+        - name: page
+          in: query
+          schema: { type: integer, default: 1, minimum: 1 }
+        - name: page_size
+          in: query
+          schema: { type: integer, default: 20, minimum: 1, maximum: 100 }
+        - name: consistency
+          in: query
+          description: Consistency level for this read
+          schema: { type: string, enum: [eventual, session, bounded-staleness, strong], default: eventual }
+      responses:
+        "200":
+          description: Paginated product list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  products:  { type: array, items: { $ref: "#/components/schemas/Product" } }
+                  page:      { type: integer }
+                  page_size: { type: integer }
+
+    post:
+      tags: [Products]
+      summary: Create a new product
+      description: |
+        Inserts a product into MongoDB and populates the Redis cache
+        (write-through pattern). Requires authentication.
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, price, category]
+              properties:
+                name:        { type: string, example: "MacBook Pro" }
+                description: { type: string }
+                price:       { type: number, format: double, example: 2499.99 }
+                stock:       { type: integer, minimum: 0, example: 50 }
+                category:    { type: string, example: electronics }
+                tags:        { type: array, items: { type: string }, example: [laptop, apple] }
+                attributes:  { type: object, additionalProperties: { type: string } }
+      responses:
+        "201":
+          description: Product created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Product" }
+        "400":
+          description: Validation error
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          description: Missing or invalid token
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /api/v1/products/search:
+    get:
+      tags: [Products]
+      summary: Full-text search across product name and description
+      description: |
+        Uses MongoDB `$text` index. Returns up to 20 results.
+        Reads from `secondaryPreferred` replica.
+      parameters:
+        - name: q
+          in: query
+          required: true
+          description: Search query string
+          schema: { type: string, example: "noise cancelling headphones" }
+      responses:
+        "200":
+          description: Search results
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  products: { type: array, items: { $ref: "#/components/schemas/Product" } }
+        "400":
+          description: Missing query parameter
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example: { error: "query parameter 'q' is required" }
+
+  /api/v1/products/{id}:
+    get:
+      tags: [Products]
+      summary: Get a single product by ID
+      description: |
+        Fetches a product from MongoDB with Redis caching.
+
+        **Caching strategy** is controlled by the `consistency` parameter:
+
+        | Value | Strategy | Cache behaviour |
+        |---|---|---|
+        | `eventual` (default) | Singleflight cache-aside | Check Redis → miss → MongoDB → populate cache |
+        | `stale` | Stale-while-revalidate | Serve stale immediately, refresh async |
+        | `strong` | Always DB | Skip cache, read MongoDB primary, heal cache if stale |
+
+        Response headers indicate the strategy used:
+        - `X-Cache-Strategy: singleflight-cache-aside | stale-while-revalidate | strong-consistency`
+        - `X-Cache: FRESH | STALE` (stale mode only)
+        - `X-Consistency: eventual | strong`
+        - `Warning: 110 - Response is Stale` (when serving stale data)
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: MongoDB ObjectID hex string
+          schema: { type: string, example: "64a1f2b3c4d5e6f7a8b9c0d1" }
+        - name: consistency
+          in: query
+          schema: { type: string, enum: [eventual, stale, strong], default: eventual }
+      responses:
+        "200":
+          description: Product found
+          headers:
+            X-Cache-Strategy:
+              schema: { type: string }
+            X-Cache:
+              schema: { type: string, enum: [FRESH, STALE] }
+            X-Consistency:
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Product" }
+        "404":
+          description: Product not found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  # ── Orders ───────────────────────────────────────────────────────────────────
+  /api/v1/orders:
+    get:
+      tags: [Orders]
+      summary: List all orders for the authenticated user
+      description: |
+        Returns all orders for the current user from the correct PostgreSQL shard
+        (determined by consistent-hashing the user_id). Single-shard query — no
+        scatter-gather needed.
+
+        Consistency is controlled by `X-Consistency` header or `?consistency=` param.
+        After placing an order, use `X-Consistency: session` to guarantee
+        read-your-writes (the new order will be visible immediately).
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: consistency
+          in: query
+          schema: { type: string, enum: [eventual, session, bounded-staleness, strong], default: eventual }
+        - name: X-Consistency
+          in: header
+          schema: { type: string }
+        - name: X-Session-Token
+          in: header
+          description: Required for session consistency to track write timestamps
+          schema: { type: string }
+      responses:
+        "200":
+          description: List of orders
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  orders: { type: array, items: { $ref: "#/components/schemas/Order" } }
+        "401":
+          description: Missing or invalid token
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+    post:
+      tags: [Orders]
+      summary: Place a new order
+      description: |
+        Creates an order using the **Transactional Outbox Pattern**:
+
+        1. Acquires a distributed Redis lock (prevents duplicate submissions within 5s)
+        2. Fetches product prices from MongoDB (with retry, up to 3 attempts)
+        3. Validates stock availability
+        4. Writes `orders` + `order_items` + `outbox_events` in **one atomic transaction**
+        5. Decrements stock in MongoDB (with retry)
+        6. Invalidates Redis product cache
+        7. Attempts direct Kafka publish (circuit-breaker protected, async)
+           — if Kafka is down, the outbox relay delivers the event within 1s
+        8. Returns `201` to the client
+
+        **Guarantee**: the order is never created without a corresponding
+        `order.created` event being scheduled for Kafka delivery.
+
+        **Idempotency**: sending the same request within 5s returns `409`.
+        Use `X-Correlation-ID` header to trace the request across services.
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: X-Correlation-ID
+          in: header
+          description: Optional trace ID propagated to Kafka events
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [items]
+              properties:
+                items:
+                  type: array
+                  minItems: 1
+                  items:
+                    type: object
+                    required: [product_id, quantity]
+                    properties:
+                      product_id: { type: string, example: "64a1f2b3c4d5e6f7a8b9c0d1" }
+                      quantity:   { type: integer, minimum: 1, example: 2 }
+            example:
+              items:
+                - product_id: "64a1f2b3c4d5e6f7a8b9c0d1"
+                  quantity: 2
+                - product_id: "64a1f2b3c4d5e6f7a8b9c0d2"
+                  quantity: 1
+      responses:
+        "201":
+          description: Order created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Order" }
+        "400":
+          description: Validation error, product not found, or insufficient stock
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              examples:
+                product_not_found:
+                  value: { error: "product 64a1f2b3c4d5e6f7a8b9c0d1 not found" }
+                insufficient_stock:
+                  value: { error: "insufficient stock for MacBook Pro" }
+        "401":
+          description: Missing or invalid token
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409":
+          description: Order already in progress (duplicate within 5s window)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example: { error: "order already in progress, please wait" }
+        "500":
+          description: Internal error (DB write failed)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /api/v1/orders/{id}:
+    get:
+      tags: [Orders]
+      summary: Get a single order by ID
+      description: |
+        Fetches the order and its line items from the correct PostgreSQL shard.
+        The shard is determined by consistent-hashing the authenticated user's ID.
+        Only the order owner can fetch their order.
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Order UUID
+          schema: { type: string, format: uuid }
+        - name: consistency
+          in: query
+          schema: { type: string, enum: [eventual, session, bounded-staleness, strong], default: eventual }
+      responses:
+        "200":
+          description: Order found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Order" }
+        "400":
+          description: Invalid order ID format
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          description: Missing or invalid token
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "404":
+          description: Order not found or does not belong to this user
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  # ── Cart ─────────────────────────────────────────────────────────────────────
+  /api/v1/cart:
+    get:
+      tags: [Cart]
+      summary: Get the current user's cart
+      description: |
+        Returns the cart stored in Redis. If no cart exists, returns an empty cart.
+        Carts are ephemeral (TTL 30 minutes) and stored only in Redis — not in PostgreSQL.
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: Current cart (may be empty)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Cart" }
+        "401":
+          description: Missing or invalid token
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+    delete:
+      tags: [Cart]
+      summary: Clear the entire cart
+      description: Deletes the cart from Redis. Called automatically after a successful order.
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: Cart cleared
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message: { type: string, example: "cart cleared" }
+        "401":
+          description: Missing or invalid token
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /api/v1/cart/items:
+    post:
+      tags: [Cart]
+      summary: Add an item to the cart (or increment quantity if already present)
+      description: |
+        Validates the product exists in MongoDB, then upserts the item in the
+        Redis cart. If the product is already in the cart, its quantity is
+        incremented by the requested amount.
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [product_id, quantity]
+              properties:
+                product_id: { type: string, example: "64a1f2b3c4d5e6f7a8b9c0d1" }
+                quantity:   { type: integer, minimum: 1, example: 1 }
+      responses:
+        "200":
+          description: Updated cart
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Cart" }
+        "400":
+          description: Validation error
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          description: Missing or invalid token
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "404":
+          description: Product not found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /api/v1/cart/items/{product_id}:
+    delete:
+      tags: [Cart]
+      summary: Remove a specific item from the cart
+      description: Removes the item with the given product_id from the Redis cart.
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: product_id
+          in: path
+          required: true
+          description: MongoDB ObjectID of the product to remove
+          schema: { type: string }
+      responses:
+        "200":
+          description: Updated cart (item removed)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Cart" }
+        "401":
+          description: Missing or invalid token
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  # ── Admin — Sharding ─────────────────────────────────────────────────────────
+  /api/v1/admin/shards:
+    get:
+      tags: [Admin — Sharding]
+      summary: PostgreSQL shard stats and consistent hash ring distribution
+      description: |
+        Returns per-shard row counts (users + orders) and the virtual-node
+        distribution across the consistent hash ring.
+
+        `ring_distribution` shows how many of the 16384 virtual nodes each
+        shard owns. With 150 vnodes per shard, distribution should be ~33% each.
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: Shard statistics
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  shards:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        shard_id:    { type: integer }
+                        user_count:  { type: integer }
+                        order_count: { type: integer }
+                  ring_distribution:
+                    type: object
+                    additionalProperties: { type: integer }
+                    description: "shard_id → vnode count"
+                  total_shards: { type: integer }
+              example:
+                shards:
+                  - { shard_id: 0, user_count: 3421, order_count: 8903 }
+                  - { shard_id: 1, user_count: 3398, order_count: 8812 }
+                  - { shard_id: 2, user_count: 3401, order_count: 8791 }
+                ring_distribution: { "0": 150, "1": 150, "2": 150 }
+                total_shards: 3
+
+  /api/v1/admin/orders-with-users:
+    get:
+      tags: [Admin — Sharding]
+      summary: Cross-shard scatter-gather join of orders and users
+      description: |
+        Demonstrates the **scatter-gather + application-level hash join** pattern.
+        Fans out to all PostgreSQL shards in parallel, collects orders and users,
+        performs an in-memory hash join, and returns merged results sorted by
+        `created_at DESC`.
+
+        This is the only way to JOIN data across shards — SQL JOINs cannot span
+        separate PostgreSQL instances.
+
+        **Warning**: result set is held in application memory. Use `limit` to
+        cap memory usage. Not suitable for real-time user-facing queries.
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: status
+          in: query
+          description: Filter by order status
+          schema: { type: string, enum: [pending, confirmed, shipped, delivered, cancelled] }
+        - name: limit
+          in: query
+          description: Maximum results (capped at 200)
+          schema: { type: integer, default: 50, maximum: 200 }
+      responses:
+        "200":
+          description: Joined results
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  results:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        order_id:    { type: string, format: uuid }
+                        user_id:     { type: string, format: uuid }
+                        user_email:  { type: string }
+                        user_name:   { type: string }
+                        status:      { type: string }
+                        total_price: { type: number }
+                        created_at:  { type: string, format: date-time }
+                        shard_key:   { type: integer }
+                  count: { type: integer }
+                  note:  { type: string }
+
+  # ── Admin — Replication ───────────────────────────────────────────────────────
+  /api/v1/admin/replication-lag:
+    get:
+      tags: [Admin — Replication]
+      summary: PostgreSQL replication lag per shard and replica
+      description: |
+        Returns the current replication lag (seconds) for every replica across
+        all shards. Polled every 10 seconds by the background monitor.
+
+        **Routing impact**: replicas with `lag_seconds > 5` are marked `degraded=true`
+        and skipped for reads. Reads fall back to the primary until the replica recovers.
+
+        This makes the consistency vs. availability tradeoff visible:
+        - `degraded=false`: reads go to replica (eventual consistency, low latency)
+        - `degraded=true`: reads go to primary (strong consistency, higher load)
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: Replication lag report
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  shards:
+                    type: array
+                    items: { $ref: "#/components/schemas/ShardLagInfo" }
+                  max_lag_threshold: { type: number, example: 5.0 }
+                  note: { type: string }
+              example:
+                shards:
+                  - shard_id: 0
+                    replicas:
+                      - { index: 0, lag_seconds: 0.12, degraded: false }
+                  - shard_id: 1
+                    replicas:
+                      - { index: 0, lag_seconds: 6.3, degraded: true }
+                max_lag_threshold: 5.0
+                note: "replicas with lag > threshold are skipped for reads (fall back to primary)"
+
+  # ── Admin — Cache ─────────────────────────────────────────────────────────────
+  /api/v1/admin/cache-inconsistencies:
+    get:
+      tags: [Admin — Cache]
+      summary: Recent cache/DB inconsistency events
+      description: |
+        Returns the last 100 detected inconsistencies between Redis cache and
+        MongoDB (detected during `strong` consistency reads).
+
+        An inconsistency occurs when the cached value differs from the DB value.
+        The system auto-heals by updating the cache, but the event is logged here
+        for observability.
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: Inconsistency log
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  events:
+                    type: array
+                    items: { $ref: "#/components/schemas/InconsistencyEvent" }
+                  count: { type: integer }
+
+  /api/v1/admin/cache-tag/{tag}:
+    get:
+      tags: [Admin — Cache]
+      summary: Get the current version for a cache tag
+      description: |
+        Returns the current version number for a named cache tag.
+        All cache keys for this tag embed the version; bumping the version
+        effectively invalidates all tagged keys without deleting them.
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: tag
+          in: path
+          required: true
+          schema: { type: string, example: products }
+      responses:
+        "200":
+          description: Tag version
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tag:     { type: string }
+                  version: { type: integer }
+
+  /api/v1/admin/cache-tag/{tag}/bump:
+    post:
+      tags: [Admin — Cache]
+      summary: Bump a cache tag version (bulk invalidation)
+      description: |
+        Increments the version for a cache tag. All keys with the previous version
+        are now effectively invisible (they will be ignored on reads and expire
+        naturally via TTL).
+
+        Use this to invalidate all products in a category, all user sessions, etc.
+        without iterating over individual keys.
+
+        **Tradeoff**: old keys accumulate in Redis until their TTL expires.
+        Memory usage temporarily increases after a bump.
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: tag
+          in: path
+          required: true
+          schema: { type: string, example: products }
+      responses:
+        "200":
+          description: Tag bumped
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tag:         { type: string }
+                  new_version: { type: integer }
+                  note:        { type: string }
+
+  /api/v1/admin/redis-cluster:
+    get:
+      tags: [Admin — Cache]
+      summary: Redis Cluster node stats (cluster mode only)
+      description: |
+        Returns per-node memory, keyspace, and replication info for each node
+        in the Redis Cluster. Only available when `redis.cluster.enabled=true`.
+
+        In standalone mode, returns `{ "mode": "standalone" }`.
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: Cluster node stats or standalone mode indicator
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  mode:  { type: string, enum: [cluster, standalone] }
+                  nodes: { type: array, items: { type: object } }
+                  note:  { type: string }
+
+  /api/v1/admin/redis-hot-keys:
+    get:
+      tags: [Admin — Cache]
+      summary: Top-10 hot Redis keys (cluster mode only)
+      description: |
+        Returns the 10 most frequently accessed Redis keys in the current
+        detection window. Hot keys are automatically promoted to the local
+        in-process shard cache (zero Redis RTT for subsequent reads).
+
+        **Tradeoff**: local cache TTL is 5 seconds. Stale reads are possible
+        within that window. Each API instance has an independent local cache.
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: Hot key list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  hot_keys:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        key:   { type: string }
+                        count: { type: integer }
+                  note:     { type: string }
+                  tradeoff: { type: string }
+
+  /api/v1/admin/redis-slot:
+    get:
+      tags: [Admin — Cache]
+      summary: Which Redis Cluster slot owns a given key (cluster mode only)
+      description: |
+        Computes `CRC16(key) % 16384` and returns the slot number.
+        Useful for debugging key co-location with hash tags.
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: key
+          in: query
+          required: true
+          description: Redis key to inspect
+          schema: { type: string, example: "{product:123}:data" }
+      responses:
+        "200":
+          description: Slot info
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  slot_info: { type: string, example: "key={product:123}:data slot=8432" }
+        "400":
+          description: Missing key parameter
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  # ── Admin — Kafka / Outbox ────────────────────────────────────────────────────
+  /api/v1/admin/outbox-stats:
+    get:
+      tags: [Admin — Kafka / Outbox]
+      summary: Outbox event counts per shard and status
+      description: |
+        Returns counts of outbox events by status for each PostgreSQL shard.
+
+        | Status | Meaning |
+        |---|---|
+        | `pending` | Awaiting relay publication to Kafka |
+        | `published` | Successfully delivered to Kafka |
+        | `failed` | Max retries (10) exceeded — requires manual intervention |
+
+        A growing `pending` count indicates the relay is behind or Kafka is down.
+        A non-zero `failed` count requires investigation.
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: Outbox stats per shard
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  shards:
+                    type: array
+                    items: { $ref: "#/components/schemas/OutboxShardStats" }
+                  note: { type: string }
+              example:
+                shards:
+                  - shard_id: 0
+                    counts: { pending: 2, published: 15043, failed: 0 }
+                  - shard_id: 1
+                    counts: { pending: 0, published: 14891, failed: 1 }
+                note: "pending=awaiting relay publish, published=delivered to Kafka, failed=max retries exceeded"
+
+  # ── Admin — Load Balancer ─────────────────────────────────────────────────────
+  /api/v1/admin/lb-stats:
+    get:
+      tags: [Admin — Load Balancer]
+      summary: Load balancer node health and active connections
+      description: |
+        Returns per-node stats for the DB replica load balancer (weighted round-robin)
+        and the MongoDB load balancer (least-connections).
+
+        `active_conns` shows in-flight requests. `healthy=false` means the node
+        failed its last health check and is being skipped.
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: Load balancer stats
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  db_replicas:
+                    type: array
+                    items: { $ref: "#/components/schemas/NodeStats" }
+                  mongodb:
+                    type: array
+                    items: { $ref: "#/components/schemas/NodeStats" }
+                  algorithms:
+                    type: object
+                    properties:
+                      db_replicas: { type: string, example: weighted-round-robin }
+                      mongodb:     { type: string, example: least-connections }
+
+  /api/v1/admin/partition-report:
+    get:
+      tags: [Admin — Load Balancer]
+      summary: Data distribution skew across partitions
+      description: |
+        Returns the distribution of keys across partitions for orders (hash),
+        users (hash), and products (range). Computes skew coefficient
+        (stddev / mean). `rebalance_recommended=true` when skew > 0.2.
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: Partition distribution report
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  orders:
+                    type: object
+                    properties:
+                      strategy: { type: string }
+                      report:   { $ref: "#/components/schemas/DistributionReport" }
+                  users:
+                    type: object
+                    properties:
+                      strategy: { type: string }
+                      report:   { $ref: "#/components/schemas/DistributionReport" }
+                  products:
+                    type: object
+                    properties:
+                      strategy: { type: string }
+                      report:   { $ref: "#/components/schemas/DistributionReport" }
+
+  /api/v1/admin/route-key:
+    get:
+      tags: [Admin — Load Balancer]
+      summary: Show which partition a key routes to
+      description: |
+        Computes the partition for a given key under the specified entity's
+        partitioning strategy. Useful for debugging data placement.
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: key
+          in: query
+          required: true
+          description: The key to route (e.g., email address, user ID)
+          schema: { type: string, example: "alice@example.com" }
+        - name: entity
+          in: query
+          description: Which partitioner to use
+          schema: { type: string, enum: [order, user, product], default: order }
+      responses:
+        "200":
+          description: Routing result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  routing:
+                    type: object
+                    properties:
+                      key:              { type: string }
+                      partition:        { type: integer }
+                      strategy:         { type: string }
+                      total_partitions: { type: integer }
+        "400":
+          description: Missing key parameter
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  # ── Admin — Patterns ──────────────────────────────────────────────────────────
+  /api/v1/admin/bulkheads:
+    get:
+      tags: [Admin — Patterns]
+      summary: Bulkhead concurrency stats
+      description: |
+        Returns per-bulkhead capacity, current in-use count, and total
+        rejection count. Four bulkheads are configured:
+
+        | Name | Capacity | Timeout |
+        |---|---|---|
+        | product-reads | 200 | 100ms |
+        | order-writes | 50 | 500ms |
+        | payment-calls | 20 | 2s |
+        | cache-reads | 500 | 50ms |
+
+        `total_rejected` counts requests that were turned away because the
+        bulkhead was full. A rising rejection count indicates overload.
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: Bulkhead stats
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  bulkheads:
+                    type: array
+                    items: { $ref: "#/components/schemas/BulkheadStats" }
+
+  /api/v1/admin/circuit-breakers:
+    get:
+      tags: [Admin — Patterns]
+      summary: Circuit breaker states
+      description: |
+        Returns the current state and failure count for all circuit breakers.
+
+        | State | Meaning |
+        |---|---|
+        | `closed` | Normal operation |
+        | `open` | Fast-failing all requests (downstream is down) |
+        | `half-open` | Probing with one request to check recovery |
+
+        Circuit breakers configured:
+        - `kafka-publish`: opens after 5 failures, resets after 30s
+        - `db-primary`: opens after 10 failures, resets after 60s
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: Circuit breaker states
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  circuit_breakers:
+                    type: array
+                    items: { $ref: "#/components/schemas/CircuitBreakerStats" }
+                  states: { type: string }
+
+  /api/v1/admin/run-saga:
+    post:
+      tags: [Admin — Patterns]
+      summary: Run a demo order placement saga
+      description: |
+        Executes a simulated 4-step order placement saga and returns the full
+        execution trace including compensating transactions.
+
+        Steps: `ReserveStock` → `CreateOrder` → `ChargePayment` → `ConfirmOrder`
+
+        Set `fail_at` to any step name to simulate a failure and observe
+        the compensation (rollback) sequence.
+
+        Example: `fail_at: "ChargePayment"` will:
+        1. Complete ReserveStock ✓
+        2. Complete CreateOrder ✓
+        3. Fail ChargePayment ✗
+        4. Compensate: CancelOrder
+        5. Compensate: ReleaseStock
+        6. Return status: `failed`
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [user_id]
+              properties:
+                user_id:
+                  type: string
+                  format: uuid
+                  example: "550e8400-e29b-41d4-a716-446655440000"
+                fail_at:
+                  type: string
+                  description: Step name to simulate failure at
+                  enum: [ReserveStock, CreateOrder, ChargePayment, ConfirmOrder]
+                  example: ChargePayment
+      responses:
+        "200":
+          description: Saga execution trace
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  saga_execution: { $ref: "#/components/schemas/SagaExecution" }
+                  note: { type: string }
+        "400":
+          description: Validation error
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /api/v1/admin/spec-demo:
+    get:
+      tags: [Admin — Patterns]
+      summary: Demonstrate the Specification pattern
+      description: |
+        Builds a composite specification from query parameters and returns
+        the equivalent MongoDB filter and SQL WHERE clause.
+
+        Demonstrates how the same business rule generates queries for both
+        MongoDB and PostgreSQL without duplicating logic.
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: category
+          in: query
+          schema: { type: string, default: electronics }
+        - name: tag
+          in: query
+          schema: { type: string, example: laptop }
+      responses:
+        "200":
+          description: Specification output
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  description:  { type: string }
+                  mongo_filter: { type: object }
+                  sql_where:    { type: string }
+                  sql_args:     { type: array, items: {} }
+                  note:         { type: string }
+              example:
+                description: "(category=electronics AND price<500.00 AND tag=laptop AND in_stock)"
+                mongo_filter:
+                  $and:
+                    - { category: electronics }
+                    - { price: { $lt: 500 } }
+                    - { tags: laptop }
+                    - { stock: { $gt: 0 } }
+                sql_where: "(category = $1 AND price < $2 AND $3 = ANY(tags) AND stock > 0)"
+                sql_args: [electronics, 500, laptop]
+
+  /api/v1/admin/cqrs-demo:
+    post:
+      tags: [Admin — Patterns]
+      summary: Demonstrate the CQRS pattern
+      description: |
+        Shows a validated Command (write) and a Query (read) side by side.
+        Commands mutate state; queries never do. They are routed through
+        separate buses with separate validation rules.
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: CQRS demo output
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  command: { type: object }
+                  query:   { type: object }
+                  note:    { type: string }
+
+  /api/v1/admin/builder-demo:
+    post:
+      tags: [Admin — Patterns]
+      summary: Demonstrate the Builder pattern
+      description: |
+        Shows a valid Order built step-by-step and an invalid Product that
+        fails validation at `Build()` time. Demonstrates how the Builder
+        prevents invalid state from being created.
+      security:
+        - BearerAuth: []
+      responses:
+        "200":
+          description: Builder demo output
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  valid_order:           { type: object }
+                  invalid_product_error: { type: string }
+                  build_error:           { nullable: true }
+                  note:                  { type: string }
