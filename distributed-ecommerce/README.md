@@ -4,6 +4,74 @@ A production-grade Go service demonstrating **sharding**, **replication**, **cac
 
 ---
 
+## How to Run
+
+> Full step-by-step guide: **[RUNNING.md](RUNNING.md)**
+
+### Prerequisites
+
+- Docker ≥ 24 + Docker Compose ≥ 2.20
+- Go ≥ 1.22
+- `jq`, `curl`
+
+### Start everything (3 commands)
+
+```bash
+make up          # build images + start all 20 containers (~30s first run)
+make health      # verify API is up → {"status":"ok","shards":3}
+make seed        # create admin user + 2 sample products
+```
+
+### Get a token and make your first request
+
+```bash
+# Login
+TOKEN=$(curl -s -X POST http://localhost:8080/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"admin@example.com","password":"password123"}' | jq -r .token)
+
+# List products
+curl -s "http://localhost:8080/api/v1/products" | jq .
+
+# Place an order
+PRODUCT_ID=$(curl -s "http://localhost:8080/api/v1/products" | jq -r '.products[0].id')
+curl -s -X POST http://localhost:8080/api/v1/orders \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"items\":[{\"product_id\":\"$PRODUCT_ID\",\"quantity\":1}]}" | jq .
+```
+
+### Useful make targets
+
+```
+make up                  Start all containers
+make down                Stop + remove all containers and volumes
+make health              GET /health
+make seed                Create sample data
+make logs                Tail API logs
+make worker-logs         Tail worker (Kafka consumer) logs
+make kafka-ui            Open Kafka UI at http://localhost:8090
+make infra-only          Start only infrastructure (no app containers)
+make demo-products       List products
+make demo-order          Place an order (requires TOKEN env var)
+make admin-shards        PostgreSQL shard stats (requires TOKEN)
+make admin-lag           Replication lag report (requires TOKEN)
+make admin-outbox        Outbox event counts (requires TOKEN)
+make admin-saga          Run saga with simulated failure (requires TOKEN)
+make admin-all           All admin diagnostics at once (requires TOKEN)
+```
+
+### Service URLs
+
+| Service | URL |
+|---|---|
+| API | http://localhost:8080 |
+| Kafka UI | http://localhost:8090 |
+| API docs (OpenAPI) | `docs/openapi.yaml` |
+| API docs (Markdown) | `docs/API_REFERENCE.md` |
+
+---
+
 ## Architecture
 
 ```
