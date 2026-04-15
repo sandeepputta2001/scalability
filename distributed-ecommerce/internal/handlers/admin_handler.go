@@ -12,6 +12,7 @@ import (
 
 	"github.com/distributed-ecommerce/internal/cache"
 	"github.com/distributed-ecommerce/internal/db"
+	outboxPkg "github.com/distributed-ecommerce/internal/outbox"
 )
 
 type AdminHandler struct {
@@ -215,4 +216,30 @@ func (h *AdminHandler) GetSlotInfo(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"slot_info": info})
+}
+
+// GetOutboxStats godoc
+// GET /api/v1/admin/outbox-stats
+// Returns per-status counts from the outbox_events table across all shards.
+func (h *AdminHandler) GetOutboxStats(c *gin.Context) {
+	// Scatter-gather outbox stats from all shards
+	type shardStats struct {
+		ShardID int              `json:"shard_id"`
+		Counts  map[string]int64 `json:"counts"`
+	}
+
+	var results []shardStats
+	for _, ms := range h.monitor.AllShards() {
+		outboxRepo := outboxPkg.NewRepository(ms.Primary, h.log)
+		counts, err := outboxRepo.GetStats(c.Request.Context())
+		if err != nil {
+			h.log.Warn("outbox stats error", zap.Int("shard", ms.ID), zap.Error(err))
+			continue
+		}
+		results = append(results, shardStats{ShardID: ms.ID, Counts: counts})
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"shards": results,
+		"note":   "pending=awaiting relay publish, published=delivered to Kafka, failed=max retries exceeded",
+	})
 }

@@ -164,3 +164,199 @@ internal/
     order_handler.go — publishes order.created to Kafka after DB write
     auth_handler.go  — publishes user.registered to Kafka after registration
 ```
+
+
+---
+
+## Load Balancing, Data Partitioning, Distribution & Consistency
+
+### Load Balancing (`internal/loadbalancer/`)
+
+Four algorithms, all with health checking and connection tracking:
+
+| Algorithm | File | Use Case |
+|---|---|---|
+| Round-Robin | `loadbalancer.go` | Homogeneous DB replicas |
+| Weighted Round-Robin | `loadbalancer.go` | DB replicas with different capacities |
+| Least Connections | `loadbalancer.go` | MongoDB nodes (variable request duration) |
+| Consistent Hash | `loadbalancer.go` | Session affinity, cache locality |
+
+Health checker probes every 10s; unhealthy nodes are skipped automatically.
+`LoadBalancer.Do()` tracks active connections per node for least-connections routing.
+
+### Data Partitioning (`internal/partition/`)
+
+Four strategies with a `DistributionAnalyzer` that detects skew:
+
+| Strategy | Use Case | Tradeoff |
+|---|---|---|
+| Hash | Orders by user_id, Users by email | Uniform distribution; no range queries |
+| Range | Products by category (A-M, N-Z) | Range queries; hot spots on skewed data |
+| Directory | Explicit key→partition mapping | Maximum flexibility; lookup table bottleneck |
+| Composite | Tenant hash + range within tenant | Tenant isolation + range queries |
+
+`DistributionAnalyzer` computes skew coefficient (stddev/mean). Skew > 0.2 triggers `rebalance_recommended=true`.
+
+### Consistency Levels (`internal/consistency/`)
+
+Four levels selectable per-request via `X-Consistency` header or `?consistency=` param:
+
+| Level | Read Target | Write Concern | Use Case |
+|---|---|---|---|
+| `eventual` | Replica (always) | 1 node, 1s timeout | Product listings, search |
+| `session` | Primary for 5s after write | 1 node, 3s timeout | Cart, profile updates |
+| `bounded-staleness` | Replica if lag < 30s, else primary | 1 node, 3s timeout | Inventory display |
+| `strong` | Primary (always) | Majority, 5s, fsync | Checkout, payment, orders |
+
+The `ConsistencyMiddleware` injects the level into every request context. All repository reads call `consistency.RouteRead()` to select the correct pool.
+
+### New Admin Endpoints
+
+```
+GET /api/v1/admin/lb-stats           — per-node health, active connections, algorithm
+GET /api/v1/admin/partition-report   — distribution skew per entity type
+GET /api/v1/admin/route-key?key=X    — which partition a key maps to
+```
+
+### Consistency Headers
+
+Every response includes:
+```
+X-Consistency-Level: eventual|session|bounded-staleness|strong
+X-Data-Source: primary|replica
+X-Data-Age-Ms: <milliseconds>  (replica reads only)
+```
+
+
+---
+
+## Retry Mechanisms & Transactional Outbox Pattern
+
+### Retry Mechanisms (`internal/retry/`)
+
+Four components, all composable:
+
+**Exponential Backoff with Jitter** (`retry.Do`, `retry.DoWithLog`)
+- Formula: `wait = min(base × 2^attempt, maxCap) × (1 + rand(0, jitter))`
+- Jitter prevents thundering herd: without it, all retrying clients hit the server at the same moment
+- Pre-tuned configs: `DefaultConfig`, `KafkaConfig`, `DBConfig`, `HTTPConfig`
+
+**Circuit Breaker** (`retry.CircuitBreaker`)
+- States: Closed → Open → Half-Open
+- Opens after N consecutive failures; probes after resetTimeout
+- While Open: all calls fail immediately (fast-fail, no network calls)
+- Used on the direct Kafka publish path in `order_handler.go`
+
+**Retry Budget** (`retry.Budget`)
+- Caps total concurrent retries across all goroutines
+- Prevents retry storms: N goroutines × M retries = N×M calls without a budget
+- Outbox relay uses a budget of 50 concurrent Kafka retries
+
+**Error Classification** (`retry.IsTransient`, `retry.IsTransientDB`)
+- Non-retryable errors (duplicate key, permission denied, context cancelled) fail immediately
+- Retryable errors (connection reset, timeout) trigger the backoff loop
+
+### Transactional Outbox Pattern (`internal/outbox/`)
+
+**The Problem (Dual-Write)**
+```
+Without outbox:
+  1. INSERT order → PostgreSQL  ✓ committed
+  2. CRASH
+  3. Publish order.created → Kafka  ✗ never happens
+  → Order exists in DB, downstream services never know
+```
+
+**The Solution**
+```
+With outbox:
+  1. BEGIN transaction
+  2. INSERT order
+  3. INSERT outbox_event (same transaction)
+  4. COMMIT  ← both committed atomically, or both rolled back
+  5. Relay worker polls outbox_events WHERE status='pending'
+  6. Relay publishes to Kafka
+  7. Relay marks event as 'published'
+  → Order can NEVER exist without a corresponding outbox event
+```
+
+**Relay Worker**
+- Polls every 1s (configurable), batch size 100
+- `SELECT FOR UPDATE SKIP LOCKED` — multiple relay instances safe to run concurrently
+- Exponential backoff on failure: 1s → 2s → 4s → ... → 5min
+- After 10 failures: marks event as `failed` (requires manual intervention)
+- One relay per PostgreSQL shard (runs in the worker process)
+
+**Delivery Guarantee**
+- At-least-once: relay may publish twice if it crashes after Kafka ack but before marking published
+- Consumer idempotency (Redis `SET NX` on `event_id`) upgrades to exactly-once
+
+**New Admin Endpoint**
+```
+GET /api/v1/admin/outbox-stats  — per-shard counts: pending/published/failed
+```
+
+### Where Retry Is Applied
+
+| Operation | Mechanism | Config |
+|---|---|---|
+| Fetch product from MongoDB | `retry.DoWithLog` | `DBConfig` (3 attempts, 50ms base) |
+| Update stock in MongoDB | `retry.DoWithLog` | `DBConfig` |
+| Direct Kafka publish | Circuit Breaker | Opens after 5 failures, resets after 30s |
+| Outbox relay → Kafka | `retry.DoWithBudget` | `KafkaConfig` (5 attempts, 200ms base) |
+| Kafka consumer handler | Built-in consumer retry | 3 attempts with 100ms backoff |
+
+
+---
+
+## Design Patterns — Complete Inventory
+
+### Patterns already implemented (previous sessions)
+
+| Pattern | Location | Purpose |
+|---|---|---|
+| Repository | `internal/repository/` | Abstracts DB access; hides shard routing |
+| Consistent Hash Ring | `internal/db/consistent_hash.go` | Virtual-node sharding for PostgreSQL |
+| Scatter-Gather | `internal/db/cross_shard_join.go` | Fan-out queries across all shards |
+| Cache-Aside | `internal/cache/advanced.go` | Check cache → miss → DB → populate |
+| Write-Through | `internal/cache/advanced.go` | DB write + cache write atomically |
+| Write-Behind | `internal/cache/advanced.go` | Cache write → async DB write |
+| Singleflight | `internal/cache/advanced.go` | One DB call for N concurrent cache misses |
+| Stale-While-Revalidate | `internal/cache/advanced.go` | Serve stale, refresh async |
+| Distributed Lock | `internal/cache/redis.go` | Redis SET NX for mutual exclusion |
+| Rate Limiting | `internal/middleware/ratelimit.go` | Sliding-window via Redis INCR |
+| Circuit Breaker | `internal/retry/retry.go` | Fast-fail on repeated failures |
+| Retry + Backoff | `internal/retry/retry.go` | Exponential backoff with jitter |
+| Retry Budget | `internal/retry/retry.go` | Cap total retries to prevent storms |
+| Transactional Outbox | `internal/outbox/outbox.go` | Atomic DB + event write |
+| Event Envelope | `internal/kafka/events.go` | Idempotency + schema versioning |
+| Consumer Group | `internal/kafka/consumer.go` | Parallel event processing |
+| Dead-Letter Queue | `internal/kafka/consumer.go` | Failed events routed to DLQ |
+| Load Balancer (4 algos) | `internal/loadbalancer/` | RR, WRR, LeastConn, ConsistentHash |
+| Data Partitioning (4 strategies) | `internal/partition/` | Hash, Range, Directory, Composite |
+| Consistency Levels | `internal/consistency/` | Eventual, Session, Bounded, Strong |
+| Hot-Key Detection | `internal/cache/hotkey.go` | Local shard cache for hot keys |
+| Redlock | `internal/cache/cluster.go` | Multi-master distributed lock |
+
+### Patterns added in this session (`internal/patterns/`)
+
+| Pattern | File | Purpose |
+|---|---|---|
+| Builder | `builder.go` | Construct Order/Product/Query safely without telescoping constructors |
+| Observer / Event Bus | `eventbus.go` | In-process pub/sub; decouples producers from consumers |
+| CQRS | `cqrs.go` | Separate Command (write) and Query (read) models |
+| Saga Orchestrator | `saga.go` | Distributed transactions with compensating actions |
+| Bulkhead | `bulkhead.go` | Isolate resource pools; one slow service can't starve others |
+| Decorator | `decorator.go` | Composable cross-cutting concerns (logging, retry, bulkhead) on repositories |
+| Specification | `specification.go` | Composable query predicates (AND/OR/NOT) for MongoDB and SQL |
+
+### New Admin Endpoints
+
+```
+GET  /api/v1/admin/bulkheads         — per-bulkhead capacity, in-use, rejections
+GET  /api/v1/admin/circuit-breakers  — state (closed/open/half-open) + failure count
+POST /api/v1/admin/run-saga          — run order placement saga, observe compensation
+GET  /api/v1/admin/spec-demo         — build composite specification, see Mongo/SQL output
+POST /api/v1/admin/cqrs-demo         — dispatch command + query, see routing
+POST /api/v1/admin/builder-demo      — build Order/Product with validation
+```

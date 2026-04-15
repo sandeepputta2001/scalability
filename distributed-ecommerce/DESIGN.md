@@ -563,3 +563,799 @@ internal/cache/
                  HotKeyShardedClient (fan-out writes, local cache promotion)
   unified.go   — CacheClient interface + NewCacheClient factory (mode selection)
 ```
+
+
+---
+
+## 6. Load Balancing
+
+**File:** `internal/loadbalancer/loadbalancer.go`
+
+### 6a. Algorithms
+
+```
+Round-Robin:
+  requests: 1→2→3→1→2→3
+  state:    atomic counter (lock-free)
+  tradeoff: ignores node capacity and latency
+
+Weighted Round-Robin (Nginx smooth algorithm):
+  node A weight=2, node B weight=1:
+  round 1: A.current=2, B.current=1 → pick A → A.current=2-3=-1
+  round 2: A.current=1, B.current=2 → pick B → B.current=2-3=-1
+  round 3: A.current=3, B.current=0 → pick A → A.current=3-3=0
+  result: A,B,A — smooth, not bursty
+  tradeoff: requires manual weight tuning; doesn't adapt to runtime load
+
+Least Connections:
+  pick node with min(active_conns)
+  active_conns tracked with atomic.Int64 per node
+  IncrConns() before request, DecrConns() after (defer)
+  tradeoff: thundering herd if slow node suddenly frees up
+
+Consistent Hash (virtual nodes):
+  same key → same node (session affinity, cache locality)
+  150 virtual nodes per real node → even distribution
+  tradeoff: more memory; O(log N) lookup vs O(1) round-robin
+```
+
+### 6b. Health Checking
+
+```
+Background goroutine probes every 10s:
+  probe(ctx, node) → error? → mark unhealthy
+  no error?        → mark healthy, reset fail count
+
+All algorithms skip unhealthy nodes.
+If all nodes unhealthy → ErrNoHealthyNodes → caller handles fallback.
+
+Exponential back-off: fail count tracked per node.
+In production: use fail count to implement back-off before re-admitting.
+```
+
+### 6c. Where Used
+
+| Component | Algorithm | Reason |
+|---|---|---|
+| PostgreSQL replicas | Weighted Round-Robin | Equal weights in dev; tune for prod |
+| MongoDB replica set | Least Connections | Variable query duration |
+| Redis replicas | Round-Robin | Already in cache.Client |
+| HTTP upstreams | Consistent Hash | Session affinity |
+
+---
+
+## 7. Data Partitioning
+
+**File:** `internal/partition/partitioner.go`
+
+### 7a. Hash Partitioning
+
+```
+key → FNV-1a(key) % N → partition
+
+Example (N=3):
+  "user@a.com" → hash=1234567 → 1234567 % 3 = 1 → partition 1
+  "user@b.com" → hash=9876543 → 9876543 % 3 = 0 → partition 0
+
+Tradeoff:
+  ✓ Uniform distribution (on average)
+  ✓ O(1) routing
+  ✗ Adding partition N+1 remaps ~N/(N+1) of all keys
+  ✗ No range queries across partitions
+  ✗ Hot spots if data is skewed (e.g., one user has 90% of orders)
+```
+
+### 7b. Range Partitioning
+
+```
+boundaries = ["M", "Z"]  → 3 partitions
+
+key < "M"  → partition 0  (A-L)
+key < "Z"  → partition 1  (M-Y)
+key >= "Z" → partition 2  (Z+)
+
+Binary search: O(log B) where B = number of boundaries
+
+Tradeoff:
+  ✓ Range queries within a partition (e.g., all products A-M)
+  ✓ Easy to reason about data locality
+  ✗ Hot spots if data is skewed (e.g., most products start with "A")
+  ✗ Manual boundary tuning required
+  ✗ Rebalancing requires moving data between partitions
+```
+
+### 7c. Directory Partitioning
+
+```
+lookup table: {"user-vip-1": 0, "user-vip-2": 0, ...}
+unregistered keys → fall back to hash partitioning
+
+Migrate("user-vip-1", 2):
+  lookup["user-vip-1"] = 2
+  → next request for "user-vip-1" goes to partition 2
+
+Tradeoff:
+  ✓ Maximum flexibility (move any key to any partition)
+  ✓ Supports VIP/tenant isolation
+  ✗ Lookup table = single point of failure
+  ✗ Lookup table = bottleneck at high QPS
+  ✗ Must keep lookup table consistent (use Redis or distributed KV)
+```
+
+### 7d. Composite Partitioning
+
+```
+key = "user-123:order-456"
+  level 1: hash("user-123") % 3 = 1  → shard group 1
+  level 2: range("order-456") = 0    → sub-partition 0
+  global partition = 1 * 3 + 0 = 3
+
+All data for "user-123" is in shard group 1.
+Within shard group 1, orders are range-partitioned.
+
+Tradeoff:
+  ✓ Tenant isolation (all tenant data on same shard group)
+  ✓ Range queries within a tenant
+  ✗ Cross-tenant queries require scatter-gather
+  ✗ More complex routing logic
+```
+
+### 7e. Distribution Analyzer
+
+```
+Tracks key counts per partition.
+Computes: mean, stddev, skew = stddev/mean
+
+skew = 0.0  → perfectly uniform
+skew = 0.2  → 20% variation → rebalance_recommended = true
+skew = 1.0  → one partition has all the data (severe hot spot)
+
+Hottest partition: most keys → candidate for splitting
+Coldest partition: fewest keys → candidate for merging
+```
+
+---
+
+## 8. Consistency Levels
+
+**Files:** `internal/consistency/consistency.go`, `internal/middleware/consistency.go`, `internal/repository/consistency_router.go`
+
+### 8a. Decision Tree
+
+```
+Request arrives with X-Consistency: strong
+
+ConsistencyMiddleware:
+  ParseLevel("strong") → Strong
+  WithConsistency(ctx, Request{Level: Strong})
+
+Repository.GetByID(ctx, ...):
+  RouteRead(ctx, shardID, getLag)
+    → Strong → ReadFromPrimary
+  pool = shard.Primary
+  pool.QueryRow(...)
+
+Response headers:
+  X-Consistency-Level: strong
+  X-Data-Source: primary
+```
+
+### 8b. Session Consistency (Read-Your-Writes)
+
+```
+POST /api/v1/orders  (X-Session-Token: sess-abc)
+  → orderRepo.Create(ctx, order)
+  → consistency.RecordWrite("sess-abc")  // timestamp stored
+
+GET /api/v1/orders   (X-Session-Token: sess-abc, X-Consistency: session)
+  → ConsistencyMiddleware:
+      LastWrite("sess-abc") = 2s ago
+      Request{Level: Session, WriteTimestamp: 2s ago}
+  → RouteRead:
+      time.Since(WriteTimestamp) = 2s < 5s → ReadFromPrimary
+  → reads from primary (guaranteed to see the just-created order)
+
+GET /api/v1/orders   (X-Session-Token: sess-abc, X-Consistency: session)
+  (6 seconds later)
+  → RouteRead:
+      time.Since(WriteTimestamp) = 6s > 5s → ReadFromReplica
+  → reads from replica (replica has caught up by now)
+```
+
+### 8c. Bounded Staleness
+
+```
+GET /api/v1/products/:id
+  (X-Consistency: bounded-staleness, X-Max-Staleness-Ms: 10000)
+
+  → RouteRead:
+      getLag(shardID, 0) = 3.2s
+      3.2s < 10s → ReadFromReplica  ✓
+
+  → RouteRead (if replica lag = 15s):
+      15s > 10s → ReadFromPrimary  (replica too stale)
+```
+
+### 8d. CAP Theorem Mapping
+
+```
+Network partition scenario:
+  Primary is reachable, replica is not (or vice versa)
+
+Strong consistency (CP):
+  → Always read from primary
+  → If primary unreachable: request fails (consistency > availability)
+  → PostgreSQL primary-only reads
+
+Eventual consistency (AP):
+  → Read from replica
+  → If replica unreachable: fall back to primary (availability > consistency)
+  → MongoDB secondaryPreferred, Redis replica reads
+
+Bounded staleness (between CP and AP):
+  → Read from replica if lag < bound
+  → Fall back to primary if replica too stale
+  → Tunable: tighter bound → more CP-like; looser bound → more AP-like
+```
+
+### 8e. Consistency per Data Type
+
+| Data | Default Level | Rationale |
+|---|---|---|
+| Product listing | Eventual | Stale stock count OK for browsing |
+| Product detail (checkout) | Strong | Must show accurate price/stock |
+| Order creation | Strong | Idempotency + accurate stock check |
+| Order history | Session | Read-your-writes after placing order |
+| Cart | Eventual | Redis-only; no DB replication |
+| User profile | Session | See own updates immediately |
+| Analytics | Eventual | Stale data acceptable for dashboards |
+
+---
+
+## 9. New Files Summary
+
+```
+internal/
+  loadbalancer/
+    loadbalancer.go  — RoundRobin, WeightedRoundRobin, LeastConnections,
+                       ConsistentHash, HealthChecker, LoadBalancer.Do()
+
+  partition/
+    partitioner.go   — HashPartitioner, RangePartitioner, DirectoryPartitioner,
+                       CompositePartitioner, DistributionAnalyzer, Router
+
+  consistency/
+    consistency.go   — Level enum, Request, WithConsistency/FromContext,
+                       RouteRead, WriteConcernFor, SessionStore, ValidateRead,
+                       ResponseHeaders
+
+  middleware/
+    consistency.go   — ConsistencyMiddleware (injects level into context)
+
+  repository/
+    consistency_router.go — ReadPool/WritePool (consistency-aware pool selection)
+    order_repo.go    — updated: uses ReadPool/WritePool, records session writes
+
+  handlers/
+    lb_partition_handler.go — GetLBStats, GetPartitionReport, RouteKey
+```
+
+
+---
+
+## 10. Retry Mechanisms
+
+**File:** `internal/retry/retry.go`
+
+### 10a. Exponential Backoff with Jitter
+
+```
+attempt 1 fails → wait = 100ms × 2^0 × (1 + rand(0, 0.5)) = 100-150ms
+attempt 2 fails → wait = 100ms × 2^1 × (1 + rand(0, 0.5)) = 200-300ms
+attempt 3 fails → wait = 100ms × 2^2 × (1 + rand(0, 0.5)) = 400-600ms
+...capped at MaxDelay
+
+Without jitter (thundering herd):
+  t=0:    1000 clients fail simultaneously
+  t=100ms: 1000 clients retry simultaneously → server overloaded again
+  t=200ms: 1000 clients retry simultaneously → server overloaded again
+
+With jitter (spread):
+  t=0:    1000 clients fail simultaneously
+  t=100-150ms: ~333 clients retry (spread across 50ms window)
+  t=200-300ms: ~333 clients retry (spread across 100ms window)
+  t=400-600ms: ~333 clients retry (spread across 200ms window)
+  → Server load spread across time → recovery possible
+```
+
+### 10b. Circuit Breaker State Machine
+
+```
+                    failures >= maxFailures
+    ┌─────────┐ ─────────────────────────────► ┌──────────┐
+    │  CLOSED │                                 │   OPEN   │
+    │(normal) │ ◄─────────────────────────────  │(fast-fail│
+    └─────────┘    probe success                └──────────┘
+                                                      │
+                                          resetTimeout elapsed
+                                                      │
+                                                      ▼
+                                               ┌────────────┐
+                                               │ HALF-OPEN  │
+                                               │(one probe) │
+                                               └────────────┘
+                                                      │
+                                          probe fails │
+                                                      ▼
+                                               back to OPEN
+
+State transitions:
+  Closed → Open:      failures.Load() >= maxFailures
+  Open → Half-Open:   time.Since(lastFail) >= resetTimeout
+  Half-Open → Closed: probe succeeds
+  Half-Open → Open:   probe fails
+
+Tradeoff:
+  While Open: valid requests are rejected (availability ↓)
+  Benefit: downstream service gets time to recover (no overload)
+  Without CB: every request hits the failing service → cascading failure
+```
+
+### 10c. Retry Budget
+
+```
+Budget(50): max 50 concurrent retries across all goroutines
+
+Scenario without budget:
+  1000 goroutines, each retries 5 times = 5000 total calls
+  → Amplifies load by 5× during an outage
+
+Scenario with budget(50):
+  1000 goroutines attempt retry
+  50 acquire budget tokens → retry
+  950 fail fast (budget exhausted)
+  → Load amplification capped at 50 extra calls
+  → System has headroom to recover
+
+Token lifecycle:
+  Acquire() before retry → CAS decrement
+  Release() after attempt (success or failure) → CAS increment
+  If budget.remaining == 0 → fail fast, return immediately
+```
+
+### 10d. Error Classification
+
+```
+IsTransient(err):
+  false: context.Canceled, context.DeadlineExceeded
+  false: duplicate key, permission denied, syntax error (DB)
+  true:  connection reset, timeout, temporary failure
+
+Why not retry context.Canceled?
+  The client cancelled the request. Retrying would waste resources
+  on a response nobody is waiting for.
+
+Why not retry duplicate key?
+  The operation already succeeded (idempotency). Retrying would
+  create a second duplicate, not fix the error.
+```
+
+---
+
+## 11. Transactional Outbox Pattern
+
+**Files:** `internal/outbox/outbox.go`, `internal/repository/order_repo.go`, `internal/handlers/order_handler.go`
+
+### 11a. The Dual-Write Problem
+
+```
+Without outbox (broken):
+  ┌─────────────────────────────────────────────────────┐
+  │ HTTP Handler                                        │
+  │   1. INSERT order → PostgreSQL  ✓                  │
+  │   2. CRASH / network timeout                        │
+  │   3. Publish → Kafka            ✗ never happens     │
+  └─────────────────────────────────────────────────────┘
+  Result: order in DB, no Kafka event, downstream services
+          never know the order was placed.
+```
+
+### 11b. Outbox Solution
+
+```
+With outbox (correct):
+  ┌─────────────────────────────────────────────────────┐
+  │ HTTP Handler                                        │
+  │   1. Build outbox_event payload (JSON envelope)     │
+  │   2. Pass to orderRepo.Create(ctx, order, outboxEvt)│
+  └─────────────────────────────────────────────────────┘
+           │
+           ▼
+  ┌─────────────────────────────────────────────────────┐
+  │ PostgreSQL Transaction (single shard)               │
+  │   BEGIN                                             │
+  │   INSERT INTO orders ...          ← business entity │
+  │   INSERT INTO order_items ...                       │
+  │   INSERT INTO outbox_events ...   ← event record    │
+  │   COMMIT  ← atomic: all or nothing                  │
+  └─────────────────────────────────────────────────────┘
+           │
+           ▼ (async, poll every 1s)
+  ┌─────────────────────────────────────────────────────┐
+  │ Outbox Relay Worker (per shard)                     │
+  │   SELECT ... FOR UPDATE SKIP LOCKED                 │
+  │   WHERE status IN ('pending','failed')              │
+  │   AND next_retry_at <= NOW()                        │
+  │                                                     │
+  │   For each event:                                   │
+  │     retry.DoWithBudget → producer.PublishRaw        │
+  │     success → UPDATE status='published'             │
+  │     failure → UPDATE attempts++, next_retry_at=...  │
+  └─────────────────────────────────────────────────────┘
+```
+
+### 11c. Outbox Event Lifecycle
+
+```
+INSERT (status='pending', attempts=0, next_retry_at=NOW())
+  │
+  ▼ relay picks up
+PublishRaw to Kafka
+  │
+  ├─ success → UPDATE status='published', published_at=NOW()
+  │
+  └─ failure → UPDATE attempts++, next_retry_at=NOW()+backoff
+                 attempts=1 → next_retry_at = NOW()+1s
+                 attempts=2 → next_retry_at = NOW()+2s
+                 attempts=3 → next_retry_at = NOW()+4s
+                 ...
+                 attempts=10 → UPDATE status='failed'
+                               (requires manual intervention)
+```
+
+### 11d. SELECT FOR UPDATE SKIP LOCKED
+
+```
+Multiple relay workers can run concurrently (one per shard, or scaled out):
+
+Worker A:                          Worker B:
+  SELECT ... FOR UPDATE SKIP LOCKED  SELECT ... FOR UPDATE SKIP LOCKED
+  → locks rows [1,2,3]               → locks rows [4,5,6] (skips 1,2,3)
+  → processes [1,2,3]                → processes [4,5,6]
+
+Without SKIP LOCKED:
+  Worker B would block waiting for Worker A to release locks.
+  → No parallelism, relay becomes a bottleneck.
+
+With SKIP LOCKED:
+  Worker B immediately gets the next available rows.
+  → Linear scaling: N workers = N× throughput.
+```
+
+### 11e. At-Least-Once Delivery and Idempotency
+
+```
+Failure scenario:
+  1. Relay publishes event to Kafka  ✓
+  2. Relay crashes before UPDATE status='published'
+  3. On restart: relay sees event still 'pending'
+  4. Relay publishes event to Kafka AGAIN (duplicate)
+
+Consumer handles duplicate:
+  SET kafka:seen:{group}:{event_id} 1 NX EX 86400
+  → If key exists: skip (already processed)
+  → If key doesn't exist: process and set key
+
+Result: exactly-once processing despite at-least-once delivery.
+```
+
+### 11f. Direct Publish + Outbox (Dual Path)
+
+```
+Order creation flow:
+  1. Atomic DB write (order + outbox event)
+  2. Try direct Kafka publish (circuit-breaker protected, async goroutine)
+     → If Kafka is healthy: event delivered in <1ms
+     → If Kafka is down: circuit breaker opens, skip direct publish
+  3. Outbox relay delivers event within poll interval (default 1s)
+
+This gives:
+  - Low latency when Kafka is healthy (direct publish wins)
+  - Guaranteed delivery when Kafka is down (outbox relay wins)
+  - No duplicate processing (consumer idempotency handles both paths)
+```
+
+### 11g. Outbox Table Schema
+
+```sql
+CREATE TABLE outbox_events (
+    id             UUID        PRIMARY KEY,
+    aggregate_type TEXT        NOT NULL,   -- "order", "user"
+    aggregate_id   TEXT        NOT NULL,   -- order_id
+    event_type     TEXT        NOT NULL,   -- "order.created"
+    payload        JSONB       NOT NULL,   -- full kafka.Envelope JSON
+    topic          TEXT        NOT NULL,   -- "order.created"
+    partition_key  TEXT        NOT NULL,   -- user_id (for Kafka partitioning)
+    status         TEXT        NOT NULL DEFAULT 'pending',
+    attempts       INT         NOT NULL DEFAULT 0,
+    last_error     TEXT,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    published_at   TIMESTAMPTZ,
+    next_retry_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Index for relay polling (only pending/failed events, ordered by creation)
+CREATE INDEX idx_outbox_status_retry
+    ON outbox_events(status, next_retry_at)
+    WHERE status IN ('pending', 'failed');
+```
+
+---
+
+## 12. New Files Summary
+
+```
+internal/
+  retry/
+    retry.go     — Do, DoWithLog, DoWithBudget (exponential backoff + jitter)
+                   CircuitBreaker (Closed/Open/Half-Open state machine)
+                   Budget (retry storm prevention)
+                   IsTransient, IsTransientDB, IsTransientHTTP
+
+  outbox/
+    outbox.go    — Event model, Repository (Insert, FetchPending, MarkPublished,
+                   MarkFailed, GetStats), Publisher interface,
+                   Relay (poll loop, SELECT FOR UPDATE SKIP LOCKED,
+                   retry with budget, exponential backoff on failure)
+
+Updated:
+  db/migrations.go         — outbox_events table + indexes added to every shard
+  repository/order_repo.go — Create() now writes order + outbox event atomically
+  handlers/order_handler.go — builds outbox event, uses retry for MongoDB calls,
+                              circuit breaker on direct Kafka publish
+  cmd/worker/main.go       — starts one outbox relay per shard
+  handlers/admin_handler.go — /admin/outbox-stats endpoint
+```
+
+
+---
+
+## 13. Design Patterns — New Additions
+
+**File:** `internal/patterns/`
+
+### 13a. Builder Pattern
+
+```
+Problem (telescoping constructor):
+  func NewOrder(userID, item1, qty1, price1, item2, qty2, price2, status string) *Order
+  → 8 parameters, easy to mix up, no validation until runtime
+
+Solution (Builder):
+  order, err := NewOrderBuilder(userID).
+    AddItem("prod-1", 2, 99.99).
+    AddItem("prod-2", 1, 49.99).
+    WithStatus("pending").
+    Build()  ← validates all fields here, returns error if invalid
+
+Rules enforced at Build():
+  - userID must not be nil
+  - at least one item required
+  - quantity > 0, price >= 0
+  - status must be a valid value
+
+QueryBuilder:
+  Assembles parameterised SQL WHERE clauses.
+  Prevents SQL injection by always using $N placeholders.
+  Composes conditions with AND automatically.
+```
+
+### 13b. Observer / Event Bus
+
+```
+In-process pub/sub (complement to Kafka for cross-service events):
+
+  eventBus.Subscribe("product.updated", func(ctx, event) error {
+    return redisClient.InvalidateProduct(ctx, event.ProductID)
+  })
+
+  // In product handler after stock update:
+  eventBus.Publish(ctx, ProductUpdatedEvent{ProductID: id, NewStock: 45})
+  // → cache invalidation fires asynchronously, handler doesn't import cache
+
+Async mode (default):
+  Publish() returns immediately.
+  Handlers run in goroutines.
+  Panics are recovered and logged.
+
+Sync mode:
+  Publish() waits for all handlers.
+  Returns first error.
+  Use for: audit logging, validation hooks.
+
+Tradeoff vs. Kafka:
+  ✓ Zero latency (no network, no serialisation)
+  ✗ Not durable (lost on process crash)
+  ✗ Not distributed (only within one process)
+```
+
+### 13c. CQRS
+
+```
+Write path (Commands):
+  CreateOrderCommand → validate → CommandBus.Dispatch → handler → DB write
+  UpdateOrderStatusCommand → validate → handler → DB write + event
+
+Read path (Queries):
+  GetOrderQuery → QueryBus.Execute → handler → replica read → return view model
+  ListOrdersByUserQuery → handler → replica read → return list
+
+Read models (Projections):
+  OrderReadModel: denormalised, includes user email/name (pre-joined)
+  ProductReadModel: includes computed fields (in_stock, stock_level)
+
+  These are updated by Kafka consumers when events arrive:
+    order.created → update OrderReadModel
+    stock.updated → update ProductReadModel.stock, recompute stock_level
+
+Tradeoff:
+  ✓ Read replicas serve queries without touching write primary
+  ✓ Read models optimised for specific query shapes
+  ✗ Eventual consistency between write and read models
+  ✗ More code: separate command/query handlers
+```
+
+### 13d. Saga Orchestrator
+
+```
+Order Placement Saga (4 steps):
+
+  Step 1: ReserveStock (MongoDB)
+    Compensate: ReleaseStock
+
+  Step 2: CreateOrder (PostgreSQL shard)
+    Compensate: CancelOrder
+
+  Step 3: ChargePayment (external service)
+    Compensate: RefundPayment
+
+  Step 4: ConfirmOrder (PostgreSQL shard)
+    Compensate: CancelOrder
+
+Failure at Step 3 (ChargePayment):
+  → Compensate Step 2: CancelOrder
+  → Compensate Step 1: ReleaseStock
+  → Saga status: "failed" (cleanly rolled back)
+
+Failure at Step 3 AND compensation of Step 2 also fails:
+  → Saga status: "comp_failed" (needs manual intervention)
+  → Alert on-call, write to incident tracker
+
+Tradeoff vs. 2PC:
+  ✓ No distributed locks (each step commits locally)
+  ✓ Works across heterogeneous databases
+  ✗ Intermediate states visible (e.g., stock reserved but order not yet created)
+  ✗ Compensations must be idempotent
+```
+
+### 13e. Bulkhead
+
+```
+Resource pools per operation type:
+
+  product-reads:  200 concurrent, 100ms timeout
+  order-writes:   50 concurrent,  500ms timeout
+  payment-calls:  20 concurrent,  2s timeout
+  cache-reads:    500 concurrent, 50ms timeout
+
+Failure isolation scenario:
+  Payment service is slow → fills payment-calls bulkhead (20 slots)
+  New payment requests: rejected immediately (ErrBulkheadFull)
+  Product reads: unaffected (separate 200-slot bulkhead)
+  Order writes: unaffected (separate 50-slot bulkhead)
+
+Without bulkheads:
+  Payment slowness fills the shared goroutine pool
+  → All operations start timing out
+  → Full system outage from one slow dependency
+
+Semaphore implementation:
+  sem := make(chan struct{}, maxConcurrent)
+  Acquire: sem <- struct{}{}  (blocks or times out)
+  Release: <-sem              (always in defer)
+```
+
+### 13f. Decorator
+
+```
+Composable cross-cutting concerns on ProductReader:
+
+  var reader ProductReader = productRepo          // base
+  reader = WithLogging(reader, log)               // add logging
+  reader = WithBulkhead(reader, productBulkhead)  // add concurrency limit
+  reader = WithRetry(reader, DBConfig, log)       // add retry
+
+All three decorators implement ProductReader.
+The handler only sees ProductReader — unaware of decorators.
+
+Execution order for GetByID:
+  RetryDecorator.GetByID
+    → BulkheadDecorator.GetByID (acquire slot)
+      → LoggingDecorator.GetByID (start timer)
+        → ProductRepository.GetByID (actual DB call)
+      → LoggingDecorator (log duration + error)
+    → BulkheadDecorator (release slot)
+  → RetryDecorator (retry if transient error)
+
+Tradeoff:
+  ✓ Each concern is independently testable
+  ✓ Add/remove concerns without changing repository
+  ✗ Stack depth increases with each decorator
+  ✗ Interface must be kept narrow (every method needs a wrapper)
+```
+
+### 13g. Specification
+
+```
+Composable query predicates:
+
+  // Business rule: available electronics under $500 with "laptop" tag
+  spec := InCategory("electronics").
+    And(PriceBelow(500)).
+    And(HasTag("laptop")).
+    And(InStock())
+
+  // Same spec generates both MongoDB and SQL queries:
+  mongoFilter := spec.ToMongoFilter()
+  // → {"$and": [{"category":"electronics"}, {"price":{"$lt":500}},
+  //             {"tags":"laptop"}, {"stock":{"$gt":0}}]}
+
+  sqlClause, args := spec.ToSQLWhere()
+  // → "(category = $1 AND price < $2 AND $3 = ANY(tags) AND stock > 0)"
+  // → args: ["electronics", 500, "laptop"]
+
+  // In-memory filtering:
+  spec.IsSatisfiedBy(product)  // true/false
+
+Tradeoff:
+  ✓ Business rules expressed in domain language
+  ✓ Reusable: same spec used for MongoDB, SQL, and in-memory filtering
+  ✗ Complex specs may generate inefficient queries (no index hints)
+  ✗ Leaky abstraction: DB-specific optimisations are harder
+```
+
+---
+
+## 14. Complete Pattern Inventory
+
+| # | Pattern | Category | File |
+|---|---|---|---|
+| 1 | Repository | Data Access | `repository/*.go` |
+| 2 | Consistent Hash Ring | Distributed | `db/consistent_hash.go` |
+| 3 | Scatter-Gather | Distributed | `db/cross_shard_join.go` |
+| 4 | Cache-Aside | Caching | `cache/advanced.go` |
+| 5 | Write-Through | Caching | `cache/advanced.go` |
+| 6 | Write-Behind | Caching | `cache/advanced.go` |
+| 7 | Singleflight | Concurrency | `cache/advanced.go` |
+| 8 | Stale-While-Revalidate | Caching | `cache/advanced.go` |
+| 9 | Distributed Lock | Concurrency | `cache/redis.go` |
+| 10 | Redlock | Concurrency | `cache/cluster.go` |
+| 11 | Rate Limiting | Resilience | `middleware/ratelimit.go` |
+| 12 | Circuit Breaker | Resilience | `retry/retry.go` |
+| 13 | Retry + Backoff | Resilience | `retry/retry.go` |
+| 14 | Retry Budget | Resilience | `retry/retry.go` |
+| 15 | Transactional Outbox | Messaging | `outbox/outbox.go` |
+| 16 | Event Envelope | Messaging | `kafka/events.go` |
+| 17 | Consumer Group | Messaging | `kafka/consumer.go` |
+| 18 | Dead-Letter Queue | Messaging | `kafka/consumer.go` |
+| 19 | Load Balancer (4 algos) | Distributed | `loadbalancer/loadbalancer.go` |
+| 20 | Data Partitioning (4 strategies) | Distributed | `partition/partitioner.go` |
+| 21 | Consistency Levels | Distributed | `consistency/consistency.go` |
+| 22 | Hot-Key Detection | Caching | `cache/hotkey.go` |
+| 23 | Builder | Creational | `patterns/builder.go` |
+| 24 | Observer / Event Bus | Behavioural | `patterns/eventbus.go` |
+| 25 | CQRS | Architectural | `patterns/cqrs.go` |
+| 26 | Saga Orchestrator | Distributed | `patterns/saga.go` |
+| 27 | Bulkhead | Resilience | `patterns/bulkhead.go` |
+| 28 | Decorator | Structural | `patterns/decorator.go` |
+| 29 | Specification | Behavioural | `patterns/specification.go` |

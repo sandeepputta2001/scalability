@@ -152,3 +152,13 @@ func (p *Producer) Close() {
 		}
 	}
 }
+
+// PublishRaw publishes a raw key/value message to a topic.
+// Used by the outbox relay which stores pre-serialised envelope bytes.
+func (p *Producer) PublishRaw(ctx context.Context, topic string, key []byte, value []byte) error {
+	w, ok := p.writers[topic]
+	if !ok {
+		return fmt.Errorf("unknown topic: %s", topic)
+	}
+	return w.WriteMessages(ctx, kafka.Message{Key: key, Value: value})
+}

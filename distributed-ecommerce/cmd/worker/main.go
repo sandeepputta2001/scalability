@@ -17,6 +17,7 @@ import (
 	"github.com/distributed-ecommerce/internal/db"
 	kafkapkg "github.com/distributed-ecommerce/internal/kafka"
 	mongoClient "github.com/distributed-ecommerce/internal/mongo"
+	"github.com/distributed-ecommerce/internal/outbox"
 	"github.com/distributed-ecommerce/internal/repository"
 )
 
@@ -84,9 +85,12 @@ func main() {
 		log.Warn("topic creation warning", zap.Error(err))
 	}
 
-	orderRepo := repository.NewOrderRepository(shardMgr, log)
-	productRepo := repository.NewProductRepository(mc, log)
+	repMonitor := db.NewReplicationMonitor(shardMgr, log)
+	repMonitor.Start()
+	defer repMonitor.Stop()
 
+	orderRepo := repository.NewOrderRepository(shardMgr, repMonitor, log)
+	productRepo := repository.NewProductRepository(mc, log)
 	orderHandler := kafkapkg.NewOrderProcessorHandler(orderRepo, producer, log)
 	stockHandler := kafkapkg.NewStockProcessorHandler(productRepo, cacheClient, log)
 	cacheInvalidator := kafkapkg.NewCacheInvalidatorHandler(cacheClient, log)
@@ -129,11 +133,24 @@ func main() {
 		}(c)
 	}
 
-	repMonitor := db.NewReplicationMonitor(shardMgr, log)
-	repMonitor.Start()
-	defer repMonitor.Stop()
+	// ── Outbox Relay Workers (one per shard) ──────────────────────────────────
+	// Each relay polls its shard's outbox_events table and publishes to Kafka.
+	// Multiple relays can run concurrently — SELECT FOR UPDATE SKIP LOCKED
+	// ensures each event is processed by exactly one relay.
+	for _, shard := range shardMgr.AllShards() {
+		outboxRepo := outbox.NewRepository(shard.Primary, log)
+		relay := outbox.NewRelay(outboxRepo, producer, outbox.DefaultRelayConfig, log)
+		wg.Add(1)
+		go func(r *outbox.Relay, shardID int) {
+			defer wg.Done()
+			log.Info("outbox relay started", zap.Int("shard", shardID))
+			r.Run(runCtx)
+		}(relay, shard.ID)
+	}
 
-	log.Info("worker started", zap.Int("consumers", len(consumers)))
+	log.Info("worker started",
+		zap.Int("consumers", len(consumers)),
+		zap.Int("outbox_relays", shardMgr.ShardCount()))
 
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
